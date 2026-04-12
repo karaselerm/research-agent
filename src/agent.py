@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import re
@@ -16,7 +17,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from a2a.server.tasks import TaskUpdater
-from a2a.types import DataPart, Message, Part, TaskState, TextPart
+from a2a.types import (
+    DataPart,
+    FilePart,
+    FileWithBytes,
+    Message,
+    Part,
+    TaskState,
+    TextPart,
+)
 from a2a.utils import new_agent_text_message
 
 
@@ -44,23 +53,17 @@ class Agent:
         test_df = datasets.get("test")
         sample_submission_df = datasets.get("sample_submission")
 
-        # Debug artifact: raw payload preview
         await updater.add_artifact(
             parts=[Part(root=TextPart(text=payload[:30000]))],
             name="debug_input_preview.txt",
         )
 
         if sample_submission_df is None:
-            # Без sample submission риск invalid submission слишком высокий
             raise ValueError("Could not find sample_submission.csv in the incoming payload.")
 
         if train_df is None or test_df is None:
-            # Если train/test не нашли — все равно возвращаем валидный fallback
             fallback = self._fill_sample_submission(sample_submission_df)
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=fallback.to_csv(index=False)))],
-                name="submission.csv",
-            )
+            await self._add_csv_artifact(updater, "submission.csv", fallback)
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text="Used fallback sample_submission because train/test were not found."))],
                 name="debug_strategy.txt",
@@ -78,10 +81,7 @@ class Agent:
 
         if target_col is None:
             fallback = self._fill_sample_submission(sample_submission_df)
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=fallback.to_csv(index=False)))],
-                name="submission.csv",
-            )
+            await self._add_csv_artifact(updater, "submission.csv", fallback)
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text="Target column not detected; used fallback sample_submission."))],
                 name="debug_strategy.txt",
@@ -95,7 +95,6 @@ class Agent:
         X_train = train_df.drop(columns=[target_col], errors="ignore")
         X_test = test_df.copy()
 
-        # Keep id column only for final output
         if id_col and id_col in X_train.columns:
             X_train = X_train.drop(columns=[id_col], errors="ignore")
         if id_col and id_col in X_test.columns:
@@ -105,8 +104,6 @@ class Agent:
 
         X_train = self._feature_engineer(X_train, train_df)
         X_test_features = self._feature_engineer(X_test_features, test_df)
-
-        # Align columns strictly
         X_test_features = self._align_test_to_train(X_train, X_test_features)
 
         y, target_format = self._coerce_target(y_raw)
@@ -135,13 +132,11 @@ class Agent:
             target_format=target_format,
         )
 
-        # Final hard validation against sample submission
         submission = self._sanitize_submission_against_sample(
             submission=submission,
             sample_submission_df=sample_submission_df,
         )
 
-        # Debug artifacts
         debug_report = [
             f"target_col={target_col}",
             f"id_col={id_col}",
@@ -167,9 +162,21 @@ class Agent:
             name="debug_submission_preview.csv",
         )
 
+        await self._add_csv_artifact(updater, "submission.csv", submission)
+
+    async def _add_csv_artifact(self, updater: TaskUpdater, filename: str, df: pd.DataFrame) -> None:
+        csv_text = df.to_csv(index=False)
+        file_bytes_b64 = base64.b64encode(csv_text.encode("utf-8")).decode("utf-8")
+        file_part = FilePart(
+            file=FileWithBytes(
+                name=filename,
+                mimeType="text/csv",
+                bytes=file_bytes_b64,
+            )
+        )
         await updater.add_artifact(
-            parts=[Part(root=TextPart(text=submission.to_csv(index=False)))],
-            name="submission.csv",
+            parts=[Part(root=file_part)],
+            name=filename,
         )
 
     def _collect_payload(self, message: Message) -> str:
@@ -253,7 +260,6 @@ class Agent:
             if cand in train_df.columns:
                 return cand
 
-        # Heuristic fallback: low-cardinality non-id columns
         for col in reversed(train_df.columns):
             if "id" in col.lower():
                 continue
@@ -273,7 +279,6 @@ class Agent:
         if first in test_df.columns:
             return first
 
-        # safest fallback: first sample_submission column
         return first
 
     def _detect_submission_prediction_column(self, sample_submission_df: pd.DataFrame, target_col: str) -> str:
@@ -284,7 +289,6 @@ class Agent:
     def _feature_engineer(self, X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
 
-        # Spaceship Titanic style features
         if "Cabin" in raw_df.columns and "Cabin" in X.columns:
             cabin_parts = raw_df["Cabin"].astype(str).str.split("/", expand=True)
             if cabin_parts.shape[1] >= 3:
@@ -381,12 +385,7 @@ class Agent:
                 "logreg",
                 Pipeline([
                     ("pre", pre),
-                    ("model", LogisticRegression(
-                        max_iter=3000,
-                        C=1.0,
-                        solver="liblinear",
-                        random_state=42,
-                    )),
+                    ("model", LogisticRegression(max_iter=3000, C=1.0, solver="liblinear", random_state=42)),
                 ]),
             ),
             (
@@ -462,7 +461,6 @@ class Agent:
         sample_id_col = sample_submission_df.columns[0]
         sample_pred_col = sample_submission_df.columns[1]
 
-        # ID column copied in the safest possible way
         if id_col in test_df.columns:
             submission[sample_id_col] = test_df[id_col].values
         else:
@@ -510,11 +508,8 @@ class Agent:
         sample_submission_df: pd.DataFrame,
     ) -> pd.DataFrame:
         sample_cols = list(sample_submission_df.columns)
-
-        # Exact columns, exact order
         submission = submission.copy()
 
-        # If missing expected cols, recreate from sample
         if len(sample_cols) < 2:
             raise ValueError("sample_submission.csv has invalid format.")
 
@@ -527,7 +522,6 @@ class Agent:
 
         submission = submission[sample_cols[:2]]
 
-        # Exact row count
         if len(submission) != len(sample_submission_df):
             fixed = sample_submission_df.copy()
             n = min(len(submission), len(fixed))
@@ -535,7 +529,6 @@ class Agent:
             fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
             submission = fixed
 
-        # Normalize prediction format to sample
         pred_col = sample_cols[1]
         sample_vals = (
             sample_submission_df[pred_col]
