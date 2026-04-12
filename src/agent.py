@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import re
 import tarfile
 import tempfile
 from pathlib import Path
@@ -24,11 +25,12 @@ from sklearn.ensemble import (
     HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
+    VotingClassifier,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, make_scorer, mean_squared_error
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
@@ -160,6 +162,54 @@ def _normalize_bool_like(series: pd.Series) -> pd.Series:
         "f": 0,
     }
     return lowered.map(mapping)
+
+
+def _looks_like_id_name(name: str) -> bool:
+    lower = name.strip().lower()
+    if lower in {"id", "uid", "uuid", "guid"}:
+        return True
+    if lower.endswith("_id") or lower.endswith("id"):
+        return True
+    return any(token in lower for token in ["passengerid", "recordid", "rowid"])
+
+
+def _is_id_like_series(series: pd.Series, *, unique_ratio_threshold: float = 0.9) -> bool:
+    non_na = series.dropna()
+    if len(non_na) == 0:
+        return False
+
+    unique_ratio = float(non_na.nunique(dropna=True)) / float(len(non_na))
+    if unique_ratio < unique_ratio_threshold:
+        return False
+
+    if pd.api.types.is_numeric_dtype(series):
+        return True
+
+    as_str = non_na.astype(str)
+    avg_len = float(as_str.str.len().mean()) if len(as_str) else 0.0
+    return avg_len >= 6.0
+
+
+def _find_group_column(df: pd.DataFrame) -> str | None:
+    # Prefer explicit id-like names, fall back to structured high-cardinality strings.
+    for col in df.columns:
+        if _looks_like_id_name(col):
+            return col
+
+    for col in df.columns:
+        s = df[col]
+        if s.dtype != object:
+            continue
+        sample = s.dropna().astype(str).head(500)
+        if len(sample) == 0:
+            continue
+        unique_ratio = float(sample.nunique(dropna=True)) / float(len(sample))
+        if unique_ratio < 0.5:
+            continue
+        for sep in _SEPARATORS:
+            if sample.str.contains(re.escape(sep), regex=True).mean() >= 0.6:
+                return col
+    return None
 
 
 def _candidate_structured_string_columns(df: pd.DataFrame) -> list[str]:
@@ -342,50 +392,6 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
         if _is_numeric_like_object(X[col]):
             X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    if "Cabin" in raw_df.columns and "Cabin" in X.columns:
-        cabin = raw_df["Cabin"].astype(str).str.split("/", expand=True)
-        if cabin.shape[1] >= 3:
-            X["CabinDeck"] = cabin[0]
-            X["CabinNum"] = pd.to_numeric(cabin[1], errors="coerce")
-            X["CabinSide"] = cabin[2]
-
-    if "PassengerId" in raw_df.columns:
-        pid = raw_df["PassengerId"].astype(str).str.split("_", expand=True)
-        if pid.shape[1] >= 2:
-            group_id = pid[0]
-            X["GroupId"] = pd.to_numeric(group_id, errors="coerce")
-            X["WithinGroupNo"] = pd.to_numeric(pid[1], errors="coerce")
-            X["PassengerGroupSize"] = group_id.map(group_id.value_counts())
-
-    if "Name" in raw_df.columns and "Name" in X.columns:
-        name_series = raw_df["Name"].astype(str)
-        X["NameLength"] = name_series.str.len()
-        X["NameWordCount"] = name_series.str.split().str.len()
-
-    spend_cols = [c for c in ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"] if c in raw_df.columns]
-    if spend_cols:
-        for c in spend_cols:
-            X[c] = pd.to_numeric(raw_df[c], errors="coerce")
-        X["TotalSpend"] = X[spend_cols].sum(axis=1)
-        X["NoSpend"] = (X["TotalSpend"].fillna(0) == 0).astype(int)
-        luxury_cols = [c for c in ["Spa", "VRDeck"] if c in X.columns]
-        if luxury_cols:
-            X["LuxurySpend"] = X[luxury_cols].sum(axis=1)
-        if "CryoSleep" in raw_df.columns:
-            cryo = raw_df["CryoSleep"].astype(str).str.lower()
-            X["CryoNoSpendMatch"] = ((cryo.isin(["true", "1"])) & (X["NoSpend"] == 1)).astype(int)
-
-    if "Age" in raw_df.columns:
-        X["Age"] = pd.to_numeric(raw_df["Age"], errors="coerce")
-        X["AgeMissing"] = X["Age"].isna().astype(int)
-        X["Age2"] = X["Age"] ** 2
-        X["IsChild"] = (X["Age"] < 18).astype(float)
-        X["IsSenior"] = (X["Age"] >= 60).astype(float)
-
-    for col in ["HomePlanet", "Destination", "VIP", "CryoSleep"]:
-        if col in raw_df.columns:
-            X[col] = raw_df[col].astype(str)
-
     for col in _infer_bool_like_columns(X):
         mapped = _normalize_bool_like(X[col])
         if mapped.notna().mean() >= 0.8:
@@ -402,6 +408,11 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
             continue
         if (non_na >= 0).mean() >= 0.9:
             X[f"{col}__log1p"] = np.log1p(s.clip(lower=0))
+        if non_na.nunique(dropna=True) >= 10:
+            X[f"{col}__sq"] = s * s
+            abs_q95 = float(np.nanquantile(np.abs(non_na), 0.95))
+            if abs_q95 > 0:
+                X[f"{col}__z_like"] = (s - float(non_na.median())) / abs_q95
 
     object_cols = [c for c in X.columns if X[c].dtype == object]
     for col in object_cols[:10]:
@@ -416,7 +427,12 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
     X = pd.concat([X, _make_group_aggregates(X, raw_df)], axis=1)
     X = pd.concat([X, _make_bool_numeric_interactions(X)], axis=1)
 
-    drop_cols = [col for col in X.columns if col.lower() in {"name", "cabin"}]
+    # Drop raw identifier-like columns after extracting useful statistics.
+    drop_cols: list[str] = []
+    for col in X.columns:
+        if col in raw_df.columns:
+            if _looks_like_id_name(col) or _is_id_like_series(raw_df[col]):
+                drop_cols.append(col)
     if drop_cols:
         X = X.drop(columns=drop_cols, errors="ignore")
 
@@ -442,24 +458,46 @@ class CandidateResult:
     model: Any
 
 
+@dataclass(frozen=True)
+class BinaryPostprocessConfig:
+    threshold: float = 0.5
+    group_column: str | None = None
+    min_group_size: int | None = None
+    high_mean_prob: float | None = None
+    low_mean_prob: float | None = None
+
+
 def infer_task(train_df: pd.DataFrame, test_df: pd.DataFrame, sample_df: pd.DataFrame) -> dict[str, Any]:
     pred_col = sample_df.columns[1]
     id_col = sample_df.columns[0]
+    if id_col not in test_df.columns:
+        shared = [c for c in sample_df.columns if c in test_df.columns]
+        if shared:
+            id_col = shared[0]
 
-    if pred_col in train_df.columns:
+    if pred_col in train_df.columns and pred_col not in test_df.columns:
         target_col = pred_col
     else:
         candidate_cols = [c for c in train_df.columns if c not in test_df.columns]
-        if len(candidate_cols) == 1:
+        if not candidate_cols:
+            raise ValueError("Could not detect target column: no train-only columns found.")
+
+        non_id_candidates = [c for c in candidate_cols if not _looks_like_id_name(c)]
+        if len(non_id_candidates) == 1:
+            target_col = non_id_candidates[0]
+        elif len(candidate_cols) == 1:
             target_col = candidate_cols[0]
         else:
-            target_col = None
-            for c in ["target", "label", "Transported", "Survived", "Response", "Outcome"]:
-                if c in train_df.columns:
-                    target_col = c
-                    break
-            if target_col is None:
-                raise ValueError("Could not detect target column.")
+            ranked: list[tuple[float, str]] = []
+            for c in (non_id_candidates or candidate_cols):
+                s = train_df[c]
+                uniq = float(s.nunique(dropna=True))
+                ratio = uniq / max(1.0, float(len(s)))
+                # Penalize id-like columns; prefer lower-cardinality targets.
+                penalty = 1.0 if _looks_like_id_name(c) or _is_id_like_series(s) else 0.0
+                ranked.append((ratio + penalty, c))
+            ranked.sort(key=lambda item: item[0])
+            target_col = ranked[0][1]
 
     y = train_df[target_col]
     pred_values = sample_df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
@@ -693,15 +731,58 @@ def evaluate_candidates(
         raise RuntimeError("All candidate models failed.")
 
     results.sort(key=lambda r: r.score, reverse=True)
+
+    if task_type == "binary_classification":
+        ensemble_estimators: list[tuple[str, Any]] = []
+        for i, r in enumerate(results[:3]):
+            if hasattr(r.model, "predict_proba"):
+                ensemble_estimators.append((f"m{i}", r.model))
+
+        if len(ensemble_estimators) >= 2:
+            try:
+                ensemble = VotingClassifier(
+                    estimators=ensemble_estimators,
+                    voting="soft",
+                    n_jobs=1,
+                )
+                cv = StratifiedKFold(
+                    n_splits=5 if len(y) >= 500 else 4,
+                    shuffle=True,
+                    random_state=42,
+                )
+                ens_score = float(
+                    np.mean(cross_val_score(ensemble, X, y, cv=cv, scoring="accuracy", n_jobs=1))
+                )
+                logs.append(f"soft_voting_top_models: {ens_score:.6f}")
+                if ens_score > results[0].score:
+                    results.insert(
+                        0,
+                        CandidateResult(
+                            name="soft_voting_top_models",
+                            score=ens_score,
+                            model=ensemble,
+                        ),
+                    )
+            except Exception as e:
+                logs.append(f"soft_voting_top_models: FAILED ({e})")
+
     return results
 
 
 def _apply_soft_group_consensus(
     probabilities: np.ndarray,
     group_values: pd.Series,
+    config: BinaryPostprocessConfig,
     logs: list[str] | None = None,
     log_prefix: str = "soft_group_consensus",
 ) -> np.ndarray:
+    if (
+        config.min_group_size is None
+        or config.high_mean_prob is None
+        or config.low_mean_prob is None
+    ):
+        return probabilities
+
     if len(group_values) != len(probabilities):
         if logs is not None:
             logs.append(f"{log_prefix}: skipped (length mismatch)")
@@ -716,17 +797,137 @@ def _apply_soft_group_consensus(
     mean_map = probe["g"].map(stats["mean"]).to_numpy()
     count_map = probe["g"].map(stats["count"]).to_numpy()
 
-    strong_high = (count_map >= 2) & (mean_map >= 0.88)
-    strong_low = (count_map >= 2) & (mean_map <= 0.12)
+    strong_high = (count_map >= config.min_group_size) & (mean_map >= config.high_mean_prob)
+    strong_low = (count_map >= config.min_group_size) & (mean_map <= config.low_mean_prob)
 
-    out[strong_high] = np.maximum(out[strong_high], 0.90)
-    out[strong_low] = np.minimum(out[strong_low], 0.10)
+    out[strong_high] = np.maximum(out[strong_high], mean_map[strong_high])
+    out[strong_low] = np.minimum(out[strong_low], mean_map[strong_low])
 
     if logs is not None:
         changed = int(strong_high.sum() + strong_low.sum())
-        logs.append(f"{log_prefix}: adjusted_rows={changed}")
+        logs.append(
+            (
+                f"{log_prefix}: adjusted_rows={changed} "
+                f"min_group_size={config.min_group_size} "
+                f"high={config.high_mean_prob:.3f} "
+                f"low={config.low_mean_prob:.3f}"
+            )
+        )
 
     return out
+
+
+def _best_threshold(
+    probabilities: np.ndarray,
+    y_true: np.ndarray,
+    threshold_grid: np.ndarray,
+) -> tuple[float, float]:
+    best_threshold = 0.5
+    best_acc = -1.0
+    for threshold in threshold_grid:
+        acc = float(accuracy_score(y_true, (probabilities >= threshold).astype(int)))
+        if acc > best_acc:
+            best_acc = acc
+            best_threshold = float(threshold)
+    return best_threshold, best_acc
+
+
+def _calibrate_binary_postprocess(
+    ranked_results: list[CandidateResult],
+    X_train: pd.DataFrame,
+    y: pd.Series,
+    train_df: pd.DataFrame,
+    logs: list[str],
+) -> BinaryPostprocessConfig:
+    try:
+        idx = np.arange(len(y))
+        X_fit, X_val, y_fit, y_val, _, idx_val = train_test_split(
+            X_train,
+            y,
+            idx,
+            test_size=0.2,
+            random_state=42,
+            stratify=y,
+        )
+
+        val_probas: list[np.ndarray] = []
+        weights: list[float] = []
+        for r in ranked_results[:3]:
+            model = clone(r.model)
+            model.fit(X_fit, y_fit)
+            if hasattr(model, "predict_proba"):
+                val_proba = model.predict_proba(X_val)[:, 1]
+            else:
+                val_pred = model.predict(X_val)
+                val_proba = np.asarray(val_pred, dtype=float)
+            val_probas.append(val_proba)
+            weights.append(max(1e-6, float(r.score)))
+
+        if not val_probas:
+            return BinaryPostprocessConfig()
+
+        blended_val_proba = np.average(
+            np.column_stack(val_probas),
+            axis=1,
+            weights=np.asarray(weights, dtype=float),
+        )
+        threshold_grid = np.linspace(0.42, 0.58, 65)
+        threshold, base_acc = _best_threshold(
+            probabilities=blended_val_proba,
+            y_true=np.asarray(y_val),
+            threshold_grid=threshold_grid,
+        )
+        best_cfg = BinaryPostprocessConfig(threshold=threshold)
+        best_acc = base_acc
+        logs.append(f"binary_threshold_calibration: threshold={threshold:.4f} accuracy={base_acc:.6f}")
+
+        group_col = _find_group_column(train_df)
+        if group_col is None:
+            return best_cfg
+
+        group_values = train_df.iloc[idx_val][group_col]
+        for min_group_size in (2, 3):
+            for high in (0.85, 0.875, 0.9):
+                for low in (0.25, 0.275, 0.3):
+                    cfg = BinaryPostprocessConfig(
+                        threshold=threshold,
+                        group_column=group_col,
+                        min_group_size=min_group_size,
+                        high_mean_prob=high,
+                        low_mean_prob=low,
+                    )
+                    adjusted = _apply_soft_group_consensus(
+                        probabilities=blended_val_proba,
+                        group_values=group_values,
+                        config=cfg,
+                    )
+                    tuned_threshold, tuned_acc = _best_threshold(
+                        probabilities=adjusted,
+                        y_true=np.asarray(y_val),
+                        threshold_grid=threshold_grid,
+                    )
+                    if tuned_acc > best_acc:
+                        best_acc = tuned_acc
+                        best_cfg = BinaryPostprocessConfig(
+                            threshold=tuned_threshold,
+                            group_column=group_col,
+                            min_group_size=min_group_size,
+                            high_mean_prob=high,
+                            low_mean_prob=low,
+                        )
+        if best_cfg.group_column is not None:
+            logs.append(
+                (
+                    "binary_group_calibration: improved "
+                    f"accuracy={best_acc:.6f} threshold={best_cfg.threshold:.4f} "
+                    f"group_col={best_cfg.group_column} min_group_size={best_cfg.min_group_size} "
+                    f"high={best_cfg.high_mean_prob:.3f} low={best_cfg.low_mean_prob:.3f}"
+                )
+            )
+        return best_cfg
+    except Exception as e:
+        logs.append(f"binary_postprocess_calibration_failed: {e}")
+        return BinaryPostprocessConfig()
 
 
 def _predict_binary_with_blend(
@@ -734,12 +935,21 @@ def _predict_binary_with_blend(
     X_train: pd.DataFrame,
     y: pd.Series,
     X_test: pd.DataFrame,
+    train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     logs: list[str],
 ) -> np.ndarray:
-    top = ranked_results[:4]
+    top = ranked_results[:3]
     proba_preds: list[np.ndarray] = []
     weights: list[float] = []
+
+    postprocess_cfg = _calibrate_binary_postprocess(
+        ranked_results=ranked_results,
+        X_train=X_train,
+        y=y,
+        train_df=train_df,
+        logs=logs,
+    )
 
     for r in top:
         model = clone(r.model)
@@ -761,27 +971,25 @@ def _predict_binary_with_blend(
         best = clone(ranked_results[0].model)
         best.fit(X_train, y)
         if hasattr(best, "predict_proba"):
-            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+            return (best.predict_proba(X_test)[:, 1] >= postprocess_cfg.threshold).astype(int)
         return best.predict(X_test)
 
     matrix = np.column_stack(proba_preds)
     blend_proba = np.average(matrix, axis=1, weights=np.array(weights))
+    if (
+        postprocess_cfg.group_column is not None
+        and postprocess_cfg.group_column in test_df.columns
+    ):
+        blend_proba = _apply_soft_group_consensus(
+            probabilities=blend_proba,
+            group_values=test_df[postprocess_cfg.group_column],
+            config=postprocess_cfg,
+            logs=logs,
+            log_prefix=f"soft_group_consensus_{postprocess_cfg.group_column}",
+        )
 
-    if test_df.shape[1] > 0:
-        for col in test_df.columns:
-            s = test_df[col]
-            if s.dtype == object:
-                sample = s.dropna().astype(str).head(300)
-                if len(sample) > 0 and sample.str.contains("_").mean() >= 0.6:
-                    blend_proba = _apply_soft_group_consensus(
-                        probabilities=blend_proba,
-                        group_values=test_df[col],
-                        logs=logs,
-                        log_prefix=f"soft_group_consensus_{col}",
-                    )
-                    break
-
-    return (blend_proba >= 0.5).astype(int)
+    logs.append(f"binary_inference_threshold: {postprocess_cfg.threshold:.4f}")
+    return (blend_proba >= postprocess_cfg.threshold).astype(int)
 
 
 def format_predictions(
@@ -898,6 +1106,7 @@ def solve_competition(
             X_train=X_train,
             y=y,
             X_test=X_test,
+            train_df=train_df,
             test_df=test_df,
             logs=logs,
         )
