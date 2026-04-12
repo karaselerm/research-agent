@@ -17,7 +17,7 @@
   slots: {},
 
   program: {
-    image: "ghcr.io/karaselerm/research-agent:019d83f2",
+    image: "ghcr.io/karaselerm/research-agent:latest",
     entrypoint: [
       "uv",
       "run",
