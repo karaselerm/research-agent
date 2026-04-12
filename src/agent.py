@@ -166,17 +166,23 @@ class Agent:
 
     async def _add_csv_artifact(self, updater: TaskUpdater, filename: str, df: pd.DataFrame) -> None:
         csv_text = df.to_csv(index=False)
-        file_bytes_b64 = base64.b64encode(csv_text.encode("utf-8")).decode("utf-8")
-        file_part = FilePart(
-            file=FileWithBytes(
-                name=filename,
-                mimeType="text/csv",
-                bytes=file_bytes_b64,
-            )
-        )
+        encoded = base64.b64encode(csv_text.encode("utf-8")).decode("ascii")
+
         await updater.add_artifact(
-            parts=[Part(root=file_part)],
+            parts=[
+                Part(
+                    root=FilePart(
+                        file=FileWithBytes(
+                            name=filename,
+                            mimeType="text/csv",
+                            bytes=encoded,
+                        )
+                    )
+                )
+            ],
             name=filename,
+            append=False,
+            last_chunk=True,
         )
 
     def _collect_payload(self, message: Message) -> str:
