@@ -30,6 +30,11 @@ from a2a.utils import get_message_text, new_agent_text_message
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _get_llm_api_key() -> str:
+    return (
+        os.environ.get("OPENAI_API_KEY", "")
+        or os.environ.get("OPENROUTER_API_KEY", "")
+    )
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
 MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "14"))
 CODE_TIMEOUT = int(os.environ.get("CODE_TIMEOUT", "600"))
@@ -548,6 +553,9 @@ class MLAgent:
         updater: TaskUpdater | None = None,
         llm_client: OpenAIResponsesClient | None = None,
     ):
+        self._current_work_dir: Path | None = None
+        self._current_text: str = ""
+        self._current_updater: TaskUpdater | None = None
         self.workdir = Path(workdir).resolve()
         self.max_iterations = max_iterations
         self.updater = updater
@@ -1460,14 +1468,22 @@ print(json.dumps(summary, ensure_ascii=True))
 
         submission = self.workdir / "submission.csv"
         return submission if submission.exists() else None
-
 class Agent:
-    def __init__(self, *, ml_agent_cls=MLAgent):
+    def __init__(self, *, ml_agent_cls: type["MLAgent"] | None = None):
         self._done_context: set[str] = set()
-        self._ml_agent_cls = ml_agent_cls
+        self._ml_agent_cls = ml_agent_cls or MLAgent
         self.logs: list[str] = []
 
-    def _build_fallback_submission(self, test_df: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+        # нужны для совместимости с тестами и для _solve_competition
+        self._current_work_dir: Path | None = None
+        self._current_text: str = ""
+        self._current_updater: TaskUpdater | None = None
+
+    def _build_fallback_submission(
+        self,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         fallback = sample_df.copy()
         id_col = sample_df.columns[0]
 
@@ -1476,7 +1492,12 @@ class Agent:
             fallback.iloc[:n, 0] = test_df.iloc[:n][id_col].values
 
         return fallback
-    def _validate_submission(self, submission_df: pd.DataFrame, sample_df: pd.DataFrame) -> None:
+
+    def _validate_submission(
+        self,
+        submission_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+    ) -> None:
         if list(submission_df.columns) != list(sample_df.columns):
             raise ValueError(
                 f"Expected columns {list(sample_df.columns)}, got {list(submission_df.columns)}"
@@ -1487,17 +1508,6 @@ class Agent:
             )
         if submission_df.isnull().any().any():
             raise ValueError("Submission contains NaN values")
-
-    def _solve_competition(
-        self,
-        train_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        sample_df: pd.DataFrame,
-        description: str,
-        task: dict[str, object],
-    ) -> tuple[pd.DataFrame, str]:
-        _ = (train_df, test_df, sample_df, description, task)
-        raise NotImplementedError("Compatibility wrapper is not implemented for the one-file agent")
 
     async def _add_submission_artifact(
         self,
@@ -1525,6 +1535,43 @@ class Agent:
             append=False,
             last_chunk=True,
         )
+
+    def _solve_competition(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+        description: str,
+        task: dict[str, object],
+    ) -> tuple[pd.DataFrame, str]:
+        _ = (train_df, test_df, sample_df, description, task)
+
+        if self._current_work_dir is None:
+            raise RuntimeError("Current workdir is not set")
+
+        api_key = _get_llm_api_key()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY or OPENROUTER_API_KEY is required")
+
+        ml_agent = self._ml_agent_cls(
+            workdir=self._current_work_dir,
+            api_key=api_key,
+            model=OPENAI_MODEL,
+            max_iterations=MAX_ITERATIONS,
+            code_timeout=CODE_TIMEOUT,
+            updater=self._current_updater,
+        )
+
+        submission_path = ml_agent.run(self._current_text, None)
+        if submission_path is None:
+            raise FileNotFoundError("Agent did not produce submission.csv")
+
+        submission_path = _patch_submission_columns(self._current_work_dir, submission_path)
+        submission_path = normalize_submission(self._current_work_dir, submission_path)
+
+        submission_df = pd.read_csv(submission_path)
+        summary = _submission_debug_summary(submission_path)
+        return submission_df, summary
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         ctx = message.context_id or "default"
@@ -1562,10 +1609,16 @@ class Agent:
                 return
 
             data_dir = _find_data_dir(work_dir)
-            description_path = _find_first(data_dir, "description.md") or _find_first(data_dir, "README.md")
+
             description = ""
-            if description_path and description_path.exists():
-                description = description_path.read_text(encoding="utf-8", errors="replace")[:20000]
+            for candidate in ("description.md", "description.txt", "README.md"):
+                description_path = _find_first(data_dir, candidate)
+                if description_path and description_path.exists():
+                    description = description_path.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )[:20000]
+                    break
 
             train_path = _find_first(data_dir, "train.csv")
             test_path = _find_first(data_dir, "test.csv")
@@ -1582,10 +1635,25 @@ class Agent:
             test_df = pd.read_csv(test_path)
             sample_df = pd.read_csv(sample_path)
 
+            self.logs.append(
+                json.dumps(
+                    {
+                        "train_shape": list(train_df.shape),
+                        "test_shape": list(test_df.shape),
+                        "sample_shape": list(sample_df.shape),
+                        "train_path": str(train_path),
+                        "test_path": str(test_path),
+                        "sample_path": str(sample_path),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
             baseline_submission_df = self._build_fallback_submission(
                 test_df=test_df,
                 sample_df=sample_df,
             )
+            self._validate_submission(baseline_submission_df, sample_df)
 
             await updater.update_status(
                 TaskState.working,
@@ -1597,16 +1665,35 @@ class Agent:
                 artifact_id="submission",
             )
 
-            task = {"target_col": None, "id_col": sample_df.columns[0], "pred_col": sample_df.columns[1], "task_type": None}
+            task = {
+                "target_col": None,
+                "id_col": sample_df.columns[0],
+                "pred_col": sample_df.columns[1] if len(sample_df.columns) > 1 else sample_df.columns[0],
+                "task_type": None,
+            }
+
+            self._current_work_dir = work_dir
+            self._current_text = text
+            self._current_updater = updater
 
             try:
-                submission_df, _summary = self._solve_competition(
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message(
+                        f"Running universal ML agent with model {OPENAI_MODEL}..."
+                    ),
+                )
+
+                submission_df, summary = self._solve_competition(
                     train_df=train_df,
                     test_df=test_df,
                     sample_df=sample_df,
                     description=description,
                     task=task,
                 )
+                self.logs.append(summary)
+
+                self._validate_submission(submission_df, sample_df)
 
                 await updater.update_status(
                     TaskState.working,
@@ -1617,13 +1704,20 @@ class Agent:
                     submission_df=submission_df,
                     artifact_id="submission",
                 )
-            except Exception as e:
-                self.logs.append(f"fallback_used: {e}")
+
+            except Exception as exc:
+                logger.exception("ML agent failed")
+                self.logs.append(f"fallback_used: {exc}")
                 await updater.update_status(
                     TaskState.working,
                     new_agent_text_message(
                         "Model training failed or suspicious submission detected; using safe baseline submission."
                     ),
                 )
+            finally:
+                self._current_work_dir = None
+                self._current_text = ""
+                self._current_updater = None
 
         self._done_context.add(ctx)
+        logger.info("Finished context %s", ctx)
