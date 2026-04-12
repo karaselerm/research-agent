@@ -5,9 +5,8 @@
     type: "object",
     properties: {
       routerai_api_key: { type: "string", secret: true },
-      routerai_model: { type: "string", default: "openai/gpt-5.4-mini" },
-      routerai_base_url: { type: "string", default: "https://routerai.ru/api/v1" },
-      // Backward compatibility with older config names.
+      routerai_model: { type: "string" },
+      routerai_base_url: { type: "string" },
       openrouter_api_key: { type: "string", secret: true },
       openrouter_model: { type: "string" },
     },
@@ -34,7 +33,6 @@
       ROUTERAI_API_KEY: "${config.routerai_api_key}",
       ROUTERAI_MODEL: "${config.routerai_model}",
       ROUTERAI_BASE_URL: "${config.routerai_base_url}",
-      // Legacy env vars are still exported for compatibility.
       OPENROUTER_API_KEY: "${config.openrouter_api_key}",
       OPENROUTER_MODEL: "${config.openrouter_model}",
     },
