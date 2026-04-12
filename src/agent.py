@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import tarfile
 import tempfile
@@ -21,6 +22,8 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     ExtraTreesRegressor,
+    GradientBoostingClassifier,
+    GradientBoostingRegressor,
     HistGradientBoostingClassifier,
     HistGradientBoostingRegressor,
     RandomForestClassifier,
@@ -37,6 +40,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _SEPARATORS = ["_", "/", "-", "|", ":"]
+_BINARY_STRATEGY = os.environ.get("BINARY_STRATEGY", "auto").strip().lower()
+_ROUTERAI_BASE_URL = os.environ.get("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1").strip()
+_ROUTERAI_MODEL = os.environ.get(
+    "ROUTERAI_MODEL",
+    os.environ.get("OPENROUTER_MODEL", "openai/gpt-5.4-mini"),
+).strip()
 
 
 def _extract_tar_b64(b64_text: str, dest: Path) -> None:
@@ -429,6 +438,86 @@ def align_columns(X_train: pd.DataFrame, X_test: pd.DataFrame) -> pd.DataFrame:
     return X_test[X_train.columns]
 
 
+def _add_target_encoding_features(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y: pd.Series,
+    task_type: str,
+    logs: list[str] | None = None,
+    max_cols: int = 8,
+    smoothing: float = 20.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if task_type == "classification" and int(y.nunique(dropna=True)) > 2:
+        # Mean encoding for multiclass (as scalar) is often noisy.
+        return X_train, X_test
+
+    train = X_train.copy()
+    test = X_test.copy()
+    cat_cols = [c for c in train.columns if train[c].dtype == object]
+    if not cat_cols:
+        return train, test
+
+    scored: list[tuple[float, str]] = []
+    n_rows = max(1, len(train))
+    for col in cat_cols:
+        s = train[col].fillna("__NA__").astype(str)
+        nunique = int(s.nunique(dropna=False))
+        if nunique < 3:
+            continue
+        if nunique > max(50, int(0.45 * n_rows)):
+            continue
+
+        repeat_ratio = 1.0 - float(nunique) / float(n_rows)
+        sep_bonus = 0.1 if any(sep in "".join(s.head(200).tolist()) for sep in _SEPARATORS) else 0.0
+        scored.append((repeat_ratio + sep_bonus, col))
+
+    if not scored:
+        return train, test
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected_cols = [col for _, col in scored[:max_cols]]
+
+    if task_type in {"binary_classification", "classification"}:
+        splitter = StratifiedKFold(
+            n_splits=5 if len(y) >= 500 else 4,
+            shuffle=True,
+            random_state=42,
+        )
+        def _iter_splits():
+            return splitter.split(train, y)
+    else:
+        splitter = KFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        def _iter_splits():
+            return splitter.split(train)
+
+    global_mean = float(pd.to_numeric(y, errors="coerce").fillna(pd.to_numeric(y, errors="coerce").median()).mean())
+    target_values = pd.to_numeric(y, errors="coerce").fillna(global_mean)
+
+    for col in selected_cols:
+        col_train = train[col].fillna("__NA__").astype(str)
+        col_test = test[col].fillna("__NA__").astype(str) if col in test.columns else pd.Series("__NA__", index=test.index)
+
+        encoded_train = pd.Series(global_mean, index=train.index, dtype=float)
+        for tr_idx, va_idx in _iter_splits():
+            fold_cat = col_train.iloc[tr_idx]
+            fold_y = target_values.iloc[tr_idx]
+            stats = pd.DataFrame({"c": fold_cat, "y": fold_y}).groupby("c")["y"].agg(["sum", "count"])
+            smooth = (stats["sum"] + smoothing * global_mean) / (stats["count"] + smoothing)
+            encoded_train.iloc[va_idx] = col_train.iloc[va_idx].map(smooth).fillna(global_mean).to_numpy()
+
+        full_stats = pd.DataFrame({"c": col_train, "y": target_values}).groupby("c")["y"].agg(["sum", "count"])
+        full_smooth = (full_stats["sum"] + smoothing * global_mean) / (full_stats["count"] + smoothing)
+        encoded_test = col_test.map(full_smooth).fillna(global_mean).astype(float)
+
+        te_name = f"{col}__te"
+        train[te_name] = encoded_train
+        test[te_name] = encoded_test
+        if logs is not None:
+            logs.append(f"target_encoding_added: {te_name}")
+
+    return train, test
+
+
 @dataclass
 class CandidateResult:
     name: str
@@ -613,6 +702,24 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     ),
                 ),
                 (
+                    "logreg_balanced_ohe",
+                    Pipeline(
+                        [
+                            ("pre", pre_ohe),
+                            (
+                                "model",
+                                LogisticRegression(
+                                    max_iter=6000,
+                                    C=1.2,
+                                    solver="liblinear",
+                                    class_weight="balanced",
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
+                (
                     "extratrees_ohe",
                     Pipeline(
                         [
@@ -648,6 +755,24 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                         ]
                     ),
                 ),
+                (
+                    "gb_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingClassifier(
+                                    n_estimators=350,
+                                    learning_rate=0.035,
+                                    max_depth=3,
+                                    subsample=0.9,
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
             ]
         )
     elif task_type == "classification":
@@ -656,6 +781,24 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                 ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=4000, random_state=42))])),
                 ("extratrees_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesClassifier(n_estimators=1000, random_state=42, n_jobs=-1))])),
                 ("hgb_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingClassifier(max_iter=500, random_state=42))])),
+                (
+                    "gb_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingClassifier(
+                                    n_estimators=300,
+                                    learning_rate=0.04,
+                                    max_depth=3,
+                                    subsample=0.9,
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
             ]
         )
     else:
@@ -665,6 +808,24 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                 ("extratrees_reg_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesRegressor(n_estimators=1000, random_state=42, n_jobs=-1))])),
                 ("rf_reg_ohe", Pipeline([("pre", pre_ohe), ("model", RandomForestRegressor(n_estimators=800, random_state=42, n_jobs=-1))])),
                 ("hgb_reg_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingRegressor(max_iter=500, random_state=42))])),
+                (
+                    "gb_reg_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingRegressor(
+                                    n_estimators=300,
+                                    learning_rate=0.04,
+                                    max_depth=3,
+                                    subsample=0.9,
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                ),
             ]
         )
 
@@ -723,7 +884,7 @@ def _select_group_consensus_spec(
     y: pd.Series,
     min_groups: int = 12,
     min_group_size: int = 2,
-    min_gain: float = 0.03,
+    min_gain: float = 0.08,
 ) -> tuple[str, str, float] | None:
     if len(train_df) != len(y):
         return None
@@ -802,10 +963,16 @@ def _predict_binary_with_blend(
     test_df: pd.DataFrame,
     logs: list[str],
 ) -> np.ndarray:
-    _ = train_df
-    _ = test_df
-    blend_members = [r for r in ranked_results if hasattr(r.model, "predict_proba")][:3]
-    if len(blend_members) < 2:
+    def _normalize(weights: np.ndarray) -> np.ndarray:
+        weights = np.asarray(weights, dtype=float)
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        total = float(weights.sum())
+        if total <= 0:
+            return np.full_like(weights, 1.0 / max(1, len(weights)))
+        return weights / total
+
+    members = [r for r in ranked_results if hasattr(r.model, "predict_proba")][:5]
+    if len(members) < 2:
         best = clone(ranked_results[0].model)
         best.fit(X_train, y)
         logs.append(f"binary_fallback_model: {ranked_results[0].name}")
@@ -813,103 +980,145 @@ def _predict_binary_with_blend(
             return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
         return best.predict(X_test)
 
-    raw_weights = np.array([max(1e-6, float(r.score)) ** 2 for r in blend_members], dtype=float)
-    weight_sum = raw_weights.sum()
-    if weight_sum <= 0:
-        raw_weights = np.ones_like(raw_weights)
-    else:
-        raw_weights = raw_weights / weight_sum
-
-    for member, w in zip(blend_members, raw_weights):
-        logs.append(f"binary_blend_member: {member.name} weight={w:.4f}")
-
     cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
-    oof_proba = np.zeros(len(y), dtype=float)
-    oof_seen = np.zeros(len(y), dtype=bool)
+    oof_matrix = np.full((len(y), len(members)), np.nan, dtype=float)
 
     for fold, (train_idx, valid_idx) in enumerate(cv.split(X_train, y), start=1):
-        fold_preds: list[np.ndarray] = []
-        fold_weights: list[float] = []
-        for member, weight in zip(blend_members, raw_weights):
+        for j, member in enumerate(members):
             try:
                 model = clone(member.model)
                 model.fit(X_train.iloc[train_idx], y.iloc[train_idx])
-                pred = model.predict_proba(X_train.iloc[valid_idx])[:, 1]
-                fold_preds.append(pred)
-                fold_weights.append(float(weight))
+                oof_matrix[valid_idx, j] = model.predict_proba(X_train.iloc[valid_idx])[:, 1]
             except Exception as e:
-                logs.append(f"binary_blend_fold_{fold}_failed: {member.name} ({e})")
+                logs.append(f"binary_oof_fold_{fold}_failed: {member.name} ({e})")
 
-        if not fold_preds:
-            continue
-
-        fold_matrix = np.column_stack(fold_preds)
-        oof_proba[valid_idx] = np.average(
-            fold_matrix,
-            axis=1,
-            weights=np.asarray(fold_weights, dtype=float),
-        )
-        oof_seen[valid_idx] = True
-
-    if int(oof_seen.sum()) >= max(10, int(0.8 * len(y))):
-        threshold_grid = np.linspace(0.45, 0.55, 41)
-        threshold, oof_acc = _best_threshold(
-            probabilities=oof_proba[oof_seen],
-            y_true=y.iloc[oof_seen].to_numpy(),
-            threshold_grid=threshold_grid,
-        )
-        acc_at_05 = float(
-            accuracy_score(
-                y.iloc[oof_seen].to_numpy(),
-                (oof_proba[oof_seen] >= 0.5).astype(int),
-            )
-        )
-        # Keep threshold stable unless tuning gives a meaningful gain.
-        if oof_acc - acc_at_05 < 0.002:
-            threshold = 0.5
-        logs.append(
-            f"binary_blend_threshold: {threshold:.4f} oof_acc={oof_acc:.6f} acc_at_05={acc_at_05:.6f}"
-        )
-    else:
-        threshold = 0.5
-        logs.append("binary_blend_threshold: default=0.5000 (insufficient_oof)")
-
-    test_preds: list[np.ndarray] = []
-    test_weights: list[float] = []
-    for member, weight in zip(blend_members, raw_weights):
-        try:
-            model = clone(member.model)
-            model.fit(X_train, y)
-            test_preds.append(model.predict_proba(X_test)[:, 1])
-            test_weights.append(float(weight))
-        except Exception as e:
-            logs.append(f"binary_blend_full_fit_failed: {member.name} ({e})")
-
-    if not test_preds:
+    oof_mask = np.isfinite(oof_matrix).all(axis=1)
+    if int(oof_mask.sum()) < max(10, int(0.7 * len(y))):
         best = clone(ranked_results[0].model)
         best.fit(X_train, y)
-        logs.append(f"binary_fallback_model_after_blend_fail: {ranked_results[0].name}")
+        logs.append("binary_oof_insufficient: fallback_to_best_model")
         if hasattr(best, "predict_proba"):
             return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
         return best.predict(X_test)
 
-    blended_test_proba = np.average(
-        np.column_stack(test_preds),
-        axis=1,
-        weights=np.asarray(test_weights, dtype=float),
-    )
+    score_vec = np.array([max(1e-6, float(m.score)) for m in members], dtype=float)
+    w_sq = _normalize(score_vec ** 2)
+    w_cube = _normalize(score_vec ** 3)
+    for m, w in zip(members, w_sq):
+        logs.append(f"binary_member: {m.name} w_sq={w:.4f}")
+
+    oof_sq = np.average(oof_matrix[oof_mask], axis=1, weights=w_sq)
+    oof_cube = np.average(oof_matrix[oof_mask], axis=1, weights=w_cube)
+    y_oof = y.iloc[oof_mask].to_numpy()
+
+    stack_model: LogisticRegression | None = None
+    oof_stack: np.ndarray | None = None
+    try:
+        split = StratifiedKFold(n_splits=4, shuffle=True, random_state=43)
+        meta_candidates = [
+            LogisticRegression(C=0.5, max_iter=5000, solver="lbfgs"),
+            LogisticRegression(C=1.0, max_iter=5000, solver="lbfgs"),
+            LogisticRegression(C=2.0, max_iter=5000, solver="lbfgs"),
+        ]
+        best_meta = meta_candidates[0]
+        best_meta_acc = -1.0
+        for meta in meta_candidates:
+            fold_scores: list[float] = []
+            for tr_idx, va_idx in split.split(oof_matrix[oof_mask], y_oof):
+                meta.fit(oof_matrix[oof_mask][tr_idx], y_oof[tr_idx])
+                proba = meta.predict_proba(oof_matrix[oof_mask][va_idx])[:, 1]
+                pred = (proba >= 0.5).astype(int)
+                fold_scores.append(float(accuracy_score(y_oof[va_idx], pred)))
+            score = float(np.mean(fold_scores))
+            if score > best_meta_acc:
+                best_meta_acc = score
+                best_meta = meta
+
+        stack_model = clone(best_meta)
+        stack_model.fit(oof_matrix[oof_mask], y_oof)
+        oof_stack = stack_model.predict_proba(oof_matrix[oof_mask])[:, 1]
+        logs.append(f"binary_stack_meta_cv_acc: {best_meta_acc:.6f}")
+    except Exception as e:
+        logs.append(f"binary_stack_failed: {e}")
+
+    config_candidates: list[tuple[str, np.ndarray]] = [
+        ("blend_sq", oof_sq),
+        ("blend_cube", oof_cube),
+    ]
+    if oof_stack is not None:
+        config_candidates.append(("stack", oof_stack))
+        config_candidates.append(("stack_blend", 0.65 * oof_stack + 0.35 * oof_sq))
+
+    selected_name = "blend_sq"
+    selected_threshold = 0.5
+    selected_score = -1.0
+    threshold_grid = np.linspace(0.42, 0.58, 65)
+    for name, oof_proba in config_candidates:
+        thr, acc = _best_threshold(oof_proba, y_oof, threshold_grid)
+        acc_at_05 = float(accuracy_score(y_oof, (oof_proba >= 0.5).astype(int)))
+        if acc - acc_at_05 < 0.0015:
+            thr = 0.5
+            acc = acc_at_05
+        logs.append(f"binary_config_{name}: acc={acc:.6f} threshold={thr:.4f}")
+        if acc > selected_score:
+            selected_score = acc
+            selected_name = name
+            selected_threshold = thr
+
+    test_matrix = np.full((len(X_test), len(members)), np.nan, dtype=float)
+    for j, member in enumerate(members):
+        try:
+            model = clone(member.model)
+            model.fit(X_train, y)
+            test_matrix[:, j] = model.predict_proba(X_test)[:, 1]
+        except Exception as e:
+            logs.append(f"binary_test_fit_failed: {member.name} ({e})")
+
+    valid_cols = np.isfinite(test_matrix).all(axis=0)
+    if int(valid_cols.sum()) < 1:
+        best = clone(ranked_results[0].model)
+        best.fit(X_train, y)
+        logs.append("binary_test_matrix_failed: fallback_to_best_model")
+        if hasattr(best, "predict_proba"):
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+        return best.predict(X_test)
+
+    test_matrix = test_matrix[:, valid_cols]
+    valid_members = [m for m, ok in zip(members, valid_cols) if ok]
+    valid_scores = np.array([max(1e-6, float(m.score)) for m in valid_members], dtype=float)
+    test_sq = np.average(test_matrix, axis=1, weights=_normalize(valid_scores ** 2))
+    test_cube = np.average(test_matrix, axis=1, weights=_normalize(valid_scores ** 3))
+
+    if selected_name == "blend_cube":
+        final_proba = test_cube
+    elif selected_name == "stack" and stack_model is not None and test_matrix.shape[1] == len(members):
+        final_proba = stack_model.predict_proba(test_matrix)[:, 1]
+    elif selected_name == "stack_blend" and stack_model is not None and test_matrix.shape[1] == len(members):
+        stack_test = stack_model.predict_proba(test_matrix)[:, 1]
+        final_proba = 0.65 * stack_test + 0.35 * test_sq
+    else:
+        final_proba = test_sq
+
     group_spec = _select_group_consensus_spec(train_df=train_df, y=y)
     if group_spec is not None:
         group_col, sep, gain = group_spec
         logs.append(f"group_consensus_selected: col={group_col} gain={gain:.4f}")
-        blended_test_proba = _apply_group_consensus_on_test_proba(
-            probabilities=blended_test_proba,
+        final_proba = _apply_group_consensus_on_test_proba(
+            probabilities=final_proba,
             test_df=test_df,
             group_col=group_col,
             sep=sep,
             logs=logs,
         )
-    return (blended_test_proba >= threshold).astype(int)
+
+    if _BINARY_STRATEGY == "stable":
+        selected_threshold = 0.5
+    elif _BINARY_STRATEGY == "aggressive":
+        selected_threshold = float(np.clip(selected_threshold, 0.46, 0.54))
+    logs.append(
+        f"binary_selected_config: {selected_name} threshold={selected_threshold:.4f} oof_acc={selected_score:.6f} mode={_BINARY_STRATEGY}"
+    )
+    return (final_proba >= selected_threshold).astype(int)
 
 
 def format_predictions(
@@ -1013,6 +1222,14 @@ def solve_competition(
 
     y, task_meta = prepare_target(y_raw, task_type)
     effective_task_type = task_meta["task_type"]
+    X_train, X_test = _add_target_encoding_features(
+        X_train=X_train,
+        X_test=X_test,
+        y=y,
+        task_type=effective_task_type,
+        logs=logs,
+    )
+    X_test = align_columns(X_train, X_test)
 
     candidates = build_candidates(X_train, effective_task_type)
     ranked = evaluate_candidates(X_train, y, candidates, effective_task_type, logs=logs)
@@ -1208,6 +1425,11 @@ class Agent:
             self.logs.append(
                 json.dumps(
                     {
+                        "llm_config": {
+                            "provider": "routerai",
+                            "base_url": _ROUTERAI_BASE_URL,
+                            "model": _ROUTERAI_MODEL,
+                        },
                         "paths": {
                             "train": str(train_path),
                             "test": str(test_path),

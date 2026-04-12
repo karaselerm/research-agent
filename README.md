@@ -8,17 +8,23 @@ Purple A2A agent for AgentBeats MLE-bench runs.
 src/
   server.py                  # A2A server bootstrap and agent card
   executor.py                # Task execution lifecycle
-  agent.py                   # Thin orchestration layer
+  agent.py                   # Tabular ML pipeline + orchestration
   messenger.py               # A2A messaging helpers
-  purple_agent/
-    io_bundle.py             # Bundle extraction and CSV discovery
-    features.py              # Tabular feature engineering
-    modeling.py              # Candidate models and blending logic
-    submission.py            # Submission normalization/validation
 tests/
   conftest.py
   test_agent.py
 ```
+
+## RouterAI defaults
+
+The agent is configured for RouterAI with model `openai/gpt-5.4-mini`.
+
+Environment variables:
+
+- `ROUTERAI_API_KEY`
+- `ROUTERAI_BASE_URL` (default: `https://routerai.ru/api/v1`)
+- `ROUTERAI_MODEL` (default: `openai/gpt-5.4-mini`)
+- `BINARY_STRATEGY` (`auto` | `stable` | `aggressive`, default: `auto`)
 
 ## Local run
 
