@@ -25,12 +25,11 @@ from sklearn.ensemble import (
     HistGradientBoostingRegressor,
     RandomForestClassifier,
     RandomForestRegressor,
-    VotingClassifier,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, make_scorer, mean_squared_error
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
@@ -111,9 +110,10 @@ def _string_profile_features(series: pd.Series, prefix: str) -> pd.DataFrame:
     out[f"{prefix}__alpha_count"] = s.str.count(r"[A-Za-zА-Яа-я]")
     out[f"{prefix}__has_digit"] = s.str.contains(r"\d", regex=True).astype(int)
     out[f"{prefix}__is_missing_like"] = s.isin(["", "nan", "None", "none", "NaN"]).astype(int)
-
-    first_token = s.str.split().str[0]
-    last_token = s.str.split().str[-1]
+    out[f"{prefix}__unique_char_count"] = s.apply(lambda x: len(set(x)) if isinstance(x, str) else 0)
+    out[f"{prefix}__is_all_caps"] = s.str.fullmatch(r"[A-Z]+").fillna(False).astype(int)
+    first_token = s.str.split().str[0].fillna("")
+    last_token = s.str.split().str[-1].fillna("")
     out[f"{prefix}__first_token"] = first_token
     out[f"{prefix}__last_token"] = last_token
     out[f"{prefix}__first_token_freq"] = first_token.map(first_token.value_counts(dropna=False))
@@ -170,7 +170,7 @@ def _looks_like_id_name(name: str) -> bool:
         return True
     if lower.endswith("_id") or lower.endswith("id"):
         return True
-    return any(token in lower for token in ["passengerid", "recordid", "rowid"])
+    return any(token in lower for token in ["recordid", "rowid"])
 
 
 def _is_id_like_series(series: pd.Series, *, unique_ratio_threshold: float = 0.9) -> bool:
@@ -188,28 +188,6 @@ def _is_id_like_series(series: pd.Series, *, unique_ratio_threshold: float = 0.9
     as_str = non_na.astype(str)
     avg_len = float(as_str.str.len().mean()) if len(as_str) else 0.0
     return avg_len >= 6.0
-
-
-def _find_group_column(df: pd.DataFrame) -> str | None:
-    # Prefer explicit id-like names, fall back to structured high-cardinality strings.
-    for col in df.columns:
-        if _looks_like_id_name(col):
-            return col
-
-    for col in df.columns:
-        s = df[col]
-        if s.dtype != object:
-            continue
-        sample = s.dropna().astype(str).head(500)
-        if len(sample) == 0:
-            continue
-        unique_ratio = float(sample.nunique(dropna=True)) / float(len(sample))
-        if unique_ratio < 0.5:
-            continue
-        for sep in _SEPARATORS:
-            if sample.str.contains(re.escape(sep), regex=True).mean() >= 0.6:
-                return col
-    return None
 
 
 def _candidate_structured_string_columns(df: pd.DataFrame) -> list[str]:
@@ -458,15 +436,6 @@ class CandidateResult:
     model: Any
 
 
-@dataclass(frozen=True)
-class BinaryPostprocessConfig:
-    threshold: float = 0.5
-    group_column: str | None = None
-    min_group_size: int | None = None
-    high_mean_prob: float | None = None
-    low_mean_prob: float | None = None
-
-
 def infer_task(train_df: pd.DataFrame, test_df: pd.DataFrame, sample_df: pd.DataFrame) -> dict[str, Any]:
     pred_col = sample_df.columns[1]
     id_col = sample_df.columns[0]
@@ -639,7 +608,7 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     Pipeline(
                         [
                             ("pre", pre_ohe),
-                            ("model", LogisticRegression(max_iter=4000, C=1.2, solver="liblinear", random_state=42)),
+                            ("model", LogisticRegression(max_iter=5000, C=1.4, solver="liblinear", random_state=42)),
                         ]
                     ),
                 ),
@@ -648,7 +617,7 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     Pipeline(
                         [
                             ("pre", pre_ohe),
-                            ("model", ExtraTreesClassifier(n_estimators=600, random_state=42, n_jobs=-1)),
+                            ("model", ExtraTreesClassifier(n_estimators=1200, max_depth=None, min_samples_leaf=1, random_state=42, n_jobs=-1)),
                         ]
                     ),
                 ),
@@ -657,7 +626,7 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     Pipeline(
                         [
                             ("pre", pre_ohe),
-                            ("model", RandomForestClassifier(n_estimators=500, max_depth=18, min_samples_leaf=2, random_state=42, n_jobs=-1)),
+                            ("model", RandomForestClassifier(n_estimators=900, max_depth=18, min_samples_leaf=2, max_features="sqrt", random_state=42, n_jobs=-1)),
                         ]
                     ),
                 ),
@@ -666,7 +635,7 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     Pipeline(
                         [
                             ("pre", pre_ord),
-                            ("model", HistGradientBoostingClassifier(learning_rate=0.04, max_depth=8, max_iter=350, random_state=42)),
+                            ("model", HistGradientBoostingClassifier(learning_rate=0.04, max_depth=8, max_iter=500, l2_regularization=0.05, random_state=42)),
                         ]
                     ),
                 ),
@@ -675,7 +644,7 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     Pipeline(
                         [
                             ("pre", pre_ord),
-                            ("model", HistGradientBoostingClassifier(learning_rate=0.03, max_depth=10, max_iter=500, random_state=42)),
+                            ("model", HistGradientBoostingClassifier(learning_rate=0.03, max_depth=10, max_iter=700, l2_regularization=0.08, random_state=42)),
                         ]
                     ),
                 ),
@@ -684,18 +653,18 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
     elif task_type == "classification":
         candidates.extend(
             [
-                ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=3000, random_state=42))])),
-                ("extratrees_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesClassifier(n_estimators=600, random_state=42, n_jobs=-1))])),
-                ("hgb_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingClassifier(max_iter=350, random_state=42))])),
+                ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=4000, random_state=42))])),
+                ("extratrees_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesClassifier(n_estimators=1000, random_state=42, n_jobs=-1))])),
+                ("hgb_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingClassifier(max_iter=500, random_state=42))])),
             ]
         )
     else:
         candidates.extend(
             [
                 ("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))])),
-                ("extratrees_reg_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesRegressor(n_estimators=600, random_state=42, n_jobs=-1))])),
-                ("rf_reg_ohe", Pipeline([("pre", pre_ohe), ("model", RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1))])),
-                ("hgb_reg_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingRegressor(max_iter=350, random_state=42))])),
+                ("extratrees_reg_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesRegressor(n_estimators=1000, random_state=42, n_jobs=-1))])),
+                ("rf_reg_ohe", Pipeline([("pre", pre_ohe), ("model", RandomForestRegressor(n_estimators=800, random_state=42, n_jobs=-1))])),
+                ("hgb_reg_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingRegressor(max_iter=500, random_state=42))])),
             ]
         )
 
@@ -731,90 +700,7 @@ def evaluate_candidates(
         raise RuntimeError("All candidate models failed.")
 
     results.sort(key=lambda r: r.score, reverse=True)
-
-    if task_type == "binary_classification":
-        ensemble_estimators: list[tuple[str, Any]] = []
-        for i, r in enumerate(results[:3]):
-            if hasattr(r.model, "predict_proba"):
-                ensemble_estimators.append((f"m{i}", r.model))
-
-        if len(ensemble_estimators) >= 2:
-            try:
-                ensemble = VotingClassifier(
-                    estimators=ensemble_estimators,
-                    voting="soft",
-                    n_jobs=1,
-                )
-                cv = StratifiedKFold(
-                    n_splits=5 if len(y) >= 500 else 4,
-                    shuffle=True,
-                    random_state=42,
-                )
-                ens_score = float(
-                    np.mean(cross_val_score(ensemble, X, y, cv=cv, scoring="accuracy", n_jobs=1))
-                )
-                logs.append(f"soft_voting_top_models: {ens_score:.6f}")
-                if ens_score > results[0].score:
-                    results.insert(
-                        0,
-                        CandidateResult(
-                            name="soft_voting_top_models",
-                            score=ens_score,
-                            model=ensemble,
-                        ),
-                    )
-            except Exception as e:
-                logs.append(f"soft_voting_top_models: FAILED ({e})")
-
     return results
-
-
-def _apply_soft_group_consensus(
-    probabilities: np.ndarray,
-    group_values: pd.Series,
-    config: BinaryPostprocessConfig,
-    logs: list[str] | None = None,
-    log_prefix: str = "soft_group_consensus",
-) -> np.ndarray:
-    if (
-        config.min_group_size is None
-        or config.high_mean_prob is None
-        or config.low_mean_prob is None
-    ):
-        return probabilities
-
-    if len(group_values) != len(probabilities):
-        if logs is not None:
-            logs.append(f"{log_prefix}: skipped (length mismatch)")
-        return probabilities
-
-    out = probabilities.copy()
-    group_id = group_values.astype(str).str.split("_", n=1).str[0]
-
-    probe = pd.DataFrame({"g": group_id, "p": out})
-    stats = probe.groupby("g")["p"].agg(["mean", "count"])
-
-    mean_map = probe["g"].map(stats["mean"]).to_numpy()
-    count_map = probe["g"].map(stats["count"]).to_numpy()
-
-    strong_high = (count_map >= config.min_group_size) & (mean_map >= config.high_mean_prob)
-    strong_low = (count_map >= config.min_group_size) & (mean_map <= config.low_mean_prob)
-
-    out[strong_high] = np.maximum(out[strong_high], mean_map[strong_high])
-    out[strong_low] = np.minimum(out[strong_low], mean_map[strong_low])
-
-    if logs is not None:
-        changed = int(strong_high.sum() + strong_low.sum())
-        logs.append(
-            (
-                f"{log_prefix}: adjusted_rows={changed} "
-                f"min_group_size={config.min_group_size} "
-                f"high={config.high_mean_prob:.3f} "
-                f"low={config.low_mean_prob:.3f}"
-            )
-        )
-
-    return out
 
 
 def _best_threshold(
@@ -832,104 +718,6 @@ def _best_threshold(
     return best_threshold, best_acc
 
 
-def _calibrate_binary_postprocess(
-    ranked_results: list[CandidateResult],
-    X_train: pd.DataFrame,
-    y: pd.Series,
-    train_df: pd.DataFrame,
-    logs: list[str],
-) -> BinaryPostprocessConfig:
-    try:
-        idx = np.arange(len(y))
-        X_fit, X_val, y_fit, y_val, _, idx_val = train_test_split(
-            X_train,
-            y,
-            idx,
-            test_size=0.2,
-            random_state=42,
-            stratify=y,
-        )
-
-        val_probas: list[np.ndarray] = []
-        weights: list[float] = []
-        for r in ranked_results[:3]:
-            model = clone(r.model)
-            model.fit(X_fit, y_fit)
-            if hasattr(model, "predict_proba"):
-                val_proba = model.predict_proba(X_val)[:, 1]
-            else:
-                val_pred = model.predict(X_val)
-                val_proba = np.asarray(val_pred, dtype=float)
-            val_probas.append(val_proba)
-            weights.append(max(1e-6, float(r.score)))
-
-        if not val_probas:
-            return BinaryPostprocessConfig()
-
-        blended_val_proba = np.average(
-            np.column_stack(val_probas),
-            axis=1,
-            weights=np.asarray(weights, dtype=float),
-        )
-        threshold_grid = np.linspace(0.42, 0.58, 65)
-        threshold, base_acc = _best_threshold(
-            probabilities=blended_val_proba,
-            y_true=np.asarray(y_val),
-            threshold_grid=threshold_grid,
-        )
-        best_cfg = BinaryPostprocessConfig(threshold=threshold)
-        best_acc = base_acc
-        logs.append(f"binary_threshold_calibration: threshold={threshold:.4f} accuracy={base_acc:.6f}")
-
-        group_col = _find_group_column(train_df)
-        if group_col is None:
-            return best_cfg
-
-        group_values = train_df.iloc[idx_val][group_col]
-        for min_group_size in (2, 3):
-            for high in (0.85, 0.875, 0.9):
-                for low in (0.25, 0.275, 0.3):
-                    cfg = BinaryPostprocessConfig(
-                        threshold=threshold,
-                        group_column=group_col,
-                        min_group_size=min_group_size,
-                        high_mean_prob=high,
-                        low_mean_prob=low,
-                    )
-                    adjusted = _apply_soft_group_consensus(
-                        probabilities=blended_val_proba,
-                        group_values=group_values,
-                        config=cfg,
-                    )
-                    tuned_threshold, tuned_acc = _best_threshold(
-                        probabilities=adjusted,
-                        y_true=np.asarray(y_val),
-                        threshold_grid=threshold_grid,
-                    )
-                    if tuned_acc > best_acc:
-                        best_acc = tuned_acc
-                        best_cfg = BinaryPostprocessConfig(
-                            threshold=tuned_threshold,
-                            group_column=group_col,
-                            min_group_size=min_group_size,
-                            high_mean_prob=high,
-                            low_mean_prob=low,
-                        )
-        if best_cfg.group_column is not None:
-            logs.append(
-                (
-                    "binary_group_calibration: improved "
-                    f"accuracy={best_acc:.6f} threshold={best_cfg.threshold:.4f} "
-                    f"group_col={best_cfg.group_column} min_group_size={best_cfg.min_group_size} "
-                    f"high={best_cfg.high_mean_prob:.3f} low={best_cfg.low_mean_prob:.3f}"
-                )
-            )
-        return best_cfg
-    except Exception as e:
-        logs.append(f"binary_postprocess_calibration_failed: {e}")
-        return BinaryPostprocessConfig()
-
-
 def _predict_binary_with_blend(
     ranked_results: list[CandidateResult],
     X_train: pd.DataFrame,
@@ -941,11 +729,90 @@ def _predict_binary_with_blend(
 ) -> np.ndarray:
     _ = train_df
     _ = test_df
+    blend_members = [r for r in ranked_results if hasattr(r.model, "predict_proba")][:3]
+    if len(blend_members) < 2:
+        best = clone(ranked_results[0].model)
+        best.fit(X_train, y)
+        logs.append(f"binary_fallback_model: {ranked_results[0].name}")
+        if hasattr(best, "predict_proba"):
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+        return best.predict(X_test)
 
-    best = clone(ranked_results[0].model)
-    best.fit(X_train, y)
-    logs.append(f"binary_inference_model: {ranked_results[0].name}")
-    return best.predict(X_test)
+    raw_weights = np.array([max(1e-6, float(r.score)) ** 2 for r in blend_members], dtype=float)
+    weight_sum = raw_weights.sum()
+    if weight_sum <= 0:
+        raw_weights = np.ones_like(raw_weights)
+    else:
+        raw_weights = raw_weights / weight_sum
+
+    for member, w in zip(blend_members, raw_weights):
+        logs.append(f"binary_blend_member: {member.name} weight={w:.4f}")
+
+    cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+    oof_proba = np.zeros(len(y), dtype=float)
+    oof_seen = np.zeros(len(y), dtype=bool)
+
+    for fold, (train_idx, valid_idx) in enumerate(cv.split(X_train, y), start=1):
+        fold_preds: list[np.ndarray] = []
+        fold_weights: list[float] = []
+        for member, weight in zip(blend_members, raw_weights):
+            try:
+                model = clone(member.model)
+                model.fit(X_train.iloc[train_idx], y.iloc[train_idx])
+                pred = model.predict_proba(X_train.iloc[valid_idx])[:, 1]
+                fold_preds.append(pred)
+                fold_weights.append(float(weight))
+            except Exception as e:
+                logs.append(f"binary_blend_fold_{fold}_failed: {member.name} ({e})")
+
+        if not fold_preds:
+            continue
+
+        fold_matrix = np.column_stack(fold_preds)
+        oof_proba[valid_idx] = np.average(
+            fold_matrix,
+            axis=1,
+            weights=np.asarray(fold_weights, dtype=float),
+        )
+        oof_seen[valid_idx] = True
+
+    if int(oof_seen.sum()) >= max(10, int(0.8 * len(y))):
+        threshold_grid = np.linspace(0.35, 0.65, 61)
+        threshold, oof_acc = _best_threshold(
+            probabilities=oof_proba[oof_seen],
+            y_true=y.iloc[oof_seen].to_numpy(),
+            threshold_grid=threshold_grid,
+        )
+        logs.append(f"binary_blend_threshold: {threshold:.4f} oof_acc={oof_acc:.6f}")
+    else:
+        threshold = 0.5
+        logs.append("binary_blend_threshold: default=0.5000 (insufficient_oof)")
+
+    test_preds: list[np.ndarray] = []
+    test_weights: list[float] = []
+    for member, weight in zip(blend_members, raw_weights):
+        try:
+            model = clone(member.model)
+            model.fit(X_train, y)
+            test_preds.append(model.predict_proba(X_test)[:, 1])
+            test_weights.append(float(weight))
+        except Exception as e:
+            logs.append(f"binary_blend_full_fit_failed: {member.name} ({e})")
+
+    if not test_preds:
+        best = clone(ranked_results[0].model)
+        best.fit(X_train, y)
+        logs.append(f"binary_fallback_model_after_blend_fail: {ranked_results[0].name}")
+        if hasattr(best, "predict_proba"):
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+        return best.predict(X_test)
+
+    blended_test_proba = np.average(
+        np.column_stack(test_preds),
+        axis=1,
+        weights=np.asarray(test_weights, dtype=float),
+    )
+    return (blended_test_proba >= threshold).astype(int)
 
 
 def format_predictions(
