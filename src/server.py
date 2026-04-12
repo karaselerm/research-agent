@@ -29,12 +29,12 @@ def main() -> None:
     )
 
     agent_card = AgentCard(
-        name="Kartoshechko Research Agent",
-        description="A purple agent for the AgentBeats Research track, optimized for concise structured analytical responses.",
+        name="Karaselerm Research Agent",
+        description="A purple agent for the AgentBeats Research track.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version="1.0.0",
-        default_input_modes=["text"],
-        default_output_modes=["text"],
+        default_input_modes=["text", "file"],
+        default_output_modes=["text", "file"],
         capabilities=AgentCapabilities(streaming=True),
         skills=[skill],
     )
