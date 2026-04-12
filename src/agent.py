@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -1465,13 +1466,28 @@ class Agent:
                     new_agent_text_message("Building features and evaluating candidate models..."),
                 )
 
-                submission_df, summary = self._solve_competition(
-                    train_df=train_df,
-                    test_df=test_df,
-                    sample_df=sample_df,
-                    description=description,
-                    task=task,
+                solve_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._solve_competition,
+                        train_df,
+                        test_df,
+                        sample_df,
+                        description,
+                        task,
+                    )
                 )
+                heartbeat_seconds = 0
+                while not solve_task.done():
+                    await asyncio.sleep(20)
+                    heartbeat_seconds += 20
+                    await updater.update_status(
+                        TaskState.working,
+                        new_agent_text_message(
+                            f"Training models... elapsed {heartbeat_seconds}s"
+                        ),
+                    )
+
+                submission_df, summary = await solve_task
                 self.logs.append(summary)
 
                 self._validate_submission(submission_df, sample_df)
