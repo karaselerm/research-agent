@@ -22,11 +22,13 @@ The agent will run on:
 http://127.0.0.1:9009
 
 Run tests
+```
 uv sync --extra test
 uv run pytest --agent-url http://localhost:9009
 Docker
-docker build -t kartoshechko-research-agent .
+docker build -t research-agent .
 docker run -p 9009:9009 kartoshechko-research-agent
+```
 Optional environment variables
 OPENROUTER_API_KEY
 OPENROUTER_MODEL
