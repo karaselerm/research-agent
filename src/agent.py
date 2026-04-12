@@ -1,120 +1,48 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import json
 import logging
-import os
-import queue
-import re
-import signal
-import sys
 import tarfile
 import tempfile
-import time
-import traceback
-from dataclasses import dataclass
-from multiprocessing import Process, Queue
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
-from openai import OpenAI
-from pandas.api import types as pdt
-
 from a2a.server.tasks import TaskUpdater
 from a2a.types import FilePart, FileWithBytes, Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    HistGradientBoostingClassifier,
+    HistGradientBoostingRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import accuracy_score, make_scorer, mean_squared_error
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def _get_llm_api_key() -> str:
-    return (
-        os.environ.get("OPENAI_API_KEY", "")
-        or os.environ.get("OPENROUTER_API_KEY", "")
-    )
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4")
-MAX_ITERATIONS = int(os.environ.get("MAX_ITERATIONS", "14"))
-CODE_TIMEOUT = int(os.environ.get("CODE_TIMEOUT", "600"))
-
-MAX_OUTPUT_CHARS = 4000
-MAX_READ_FILE_CHARS = 50000
-READ_FILE_SIZE_LIMIT_BYTES = 200_000
-READ_FILE_CSV_SIZE_LIMIT_BYTES = 50_000
-LARGE_TABULAR_ROWS = 200_000
-LARGE_TABULAR_CELLS = 5_000_000
-EVAL_SUBSAMPLE_ROWS = 120_000
-
-SYSTEM_PROMPT = """\
-You are an expert ML engineer solving a generic MLE-bench competition.
-
-You can use these tools:
-- `run_python(code: string)`: executes Python code in a persistent interpreter session.
-- `list_files(path: string)`: lists files and directories relative to the workspace.
-- `read_file(path: string, max_chars?: integer)`: reads a UTF-8 text file.
-- `inspect_csv(path: string, max_rows?: integer)`: returns a compact JSON summary of a CSV file.
-- `infer_tabular_task(spec_json: string)`: infers target candidates, task type, feature makeup, and validation strategy.
-- `evaluate_tabular_candidates(spec_json: string)`: evaluates tabular model candidates on a single validation strategy.
-
-Environment:
-- Working directory contains the extracted competition bundle
-- Competition files are typically under `./home/data/`
-- Read the available files before making assumptions
-- Save the final answer as `./submission.csv`
-
-Required workflow:
-1. List files under `./home/data/` and identify relevant inputs.
-2. Read competition instructions from files such as `description.md` if present.
-3. Inspect the sample submission and preserve its exact columns and ordering.
-4. Use `infer_tabular_task` before training to infer task type, target candidates, and validation strategy.
-5. Use `evaluate_tabular_candidates` to compare multiple validated candidates before choosing a final approach.
-6. After choosing a simple validated approach, use `run_python` to materialize the final `submission.csv`.
-7. Finish with a plain text response once the file is written.
-
-Rules:
-- Do not use competition-specific heuristics or hardcoded assumptions about column names, targets, metrics, or feature engineering before inspecting the data.
-- Keep stdout concise. Print only the facts needed to debug progress.
-- Prefer `list_files`, `read_file`, and `inspect_csv` for exploration.
-- Never use `read_file` on large CSV files such as `train.csv`, `test.csv`, or `sample_submission.csv`; use `inspect_csv` for CSV inspection.
-- Always inspect `sample_submission.csv` with `inspect_csv`, never `read_file`.
-- For large tabular datasets, do not run heavy full-dataset experiments before selecting 1-2 candidates.
-- For large tabular datasets, start with a subsample to choose the modeling family, then do one final fit on the full training data.
-- For large tabular datasets with high-cardinality categoricals, avoid full one-hot encoding; prefer frequency/ordinal style encodings or tree-friendly pipelines.
-- Avoid nested CV and avoid ensembles by default.
-- Prefer the structured ML/eval tools for task inference and candidate comparison.
-- If a structured tool returns an error for a candidate schema, do not repeat the same schema with minor variations; switch to a supported schema or use a simple `run_python` baseline.
-- If a tool returns an error, treat it as feedback and recover in the next call instead of repeating the same mistake.
-- Use `run_python` as the fallback and for final submission materialization, not as the first choice for model selection.
-- Prefer reliable, generic code over fragile complexity.
-- If an error occurs, inspect the traceback and fix it in the next tool call.
-- Ensure the final `submission.csv` row count matches the test or sample submission.
-- Use paths starting with `./`.
-"""
-
-_WARNING_BLOCK_RE = re.compile(
-    r"^/.+?:\d+:.*?Warning:.*?$\n(?:^\s+.*?$\n)*",
-    re.MULTILINE,
-)
-
-
-def _strip_warnings(text: str) -> str:
-    return _WARNING_BLOCK_RE.sub("", text).strip()
-
-
-def _truncate_output(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    keep = max_chars - 80
-    truncated_chars = len(text) - keep
-    return f"[...{truncated_chars} chars truncated...]\n{text[-keep:]}"
+_SEPARATORS = ["_", "/", "-", "|", ":"]
 
 
 def _extract_tar_b64(b64_text: str, dest: Path) -> None:
     raw = base64.b64decode(b64_text)
     dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+    mode = "r:gz" if raw[:2] == b"\x1f\x8b" else "r:"
+    with tarfile.open(fileobj=io.BytesIO(raw), mode=mode) as tar:
         tar.extractall(dest, filter="data")
 
 
@@ -133,1357 +61,894 @@ def _first_tar_from_message(message: Message) -> str | None:
 
 
 def _find_first(root: Path, pattern: str) -> Path | None:
-    matches = sorted(root.glob(pattern))
+    matches = sorted(root.rglob(pattern))
     return matches[0] if matches else None
 
 
 def _find_data_dir(workdir: Path) -> Path:
-    inner = workdir / "home" / "data"
-    return inner if inner.is_dir() else workdir
+    candidates = [
+        workdir / "home" / "data",
+        workdir / "data",
+        workdir,
+    ]
+    for path in candidates:
+        if path.exists() and list(path.rglob("*.csv")):
+            return path
+    return workdir
 
 
-def _submission_debug_summary(submission_path: Path | None) -> str:
-    if submission_path is None:
-        return "submission_path=<none>"
-    exists = submission_path.exists()
-    if not exists:
-        return f"submission_path={submission_path} exists=false"
+def _read_csv_any(path: Path) -> pd.DataFrame | None:
+    for enc in ["utf-8", "utf-8-sig", "latin1"]:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except Exception:
+            continue
+    return None
 
-    size_bytes = submission_path.stat().st_size
-    preview = ""
-    try:
-        preview = submission_path.read_text(encoding="utf-8")[:400]
-    except Exception as exc:
-        preview = f"<failed to read preview: {exc}>"
-    return (
-        f"submission_path={submission_path} exists=true size_bytes={size_bytes}\n"
-        f"preview:\n{preview}"
+
+def _safe_to_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _is_numeric_like_object(series: pd.Series, sample_size: int = 200) -> bool:
+    if series.dtype != object:
+        return False
+    sample = series.dropna().astype(str).head(sample_size)
+    if len(sample) == 0:
+        return False
+    ratio = sample.str.fullmatch(r"-?\d+(\.\d+)?").mean()
+    return bool(ratio >= 0.8)
+
+
+def _string_profile_features(series: pd.Series, prefix: str) -> pd.DataFrame:
+    s = series.fillna("").astype(str)
+    out = pd.DataFrame(index=series.index)
+    out[f"{prefix}__len"] = s.str.len()
+    out[f"{prefix}__word_count"] = s.str.split().str.len().fillna(0)
+    out[f"{prefix}__digit_count"] = s.str.count(r"\d")
+    out[f"{prefix}__alpha_count"] = s.str.count(r"[A-Za-zА-Яа-я]")
+    out[f"{prefix}__has_digit"] = s.str.contains(r"\d", regex=True).astype(int)
+    out[f"{prefix}__is_missing_like"] = s.isin(["", "nan", "None", "none", "NaN"]).astype(int)
+
+    first_token = s.str.split().str[0]
+    last_token = s.str.split().str[-1]
+    out[f"{prefix}__first_token"] = first_token
+    out[f"{prefix}__last_token"] = last_token
+    out[f"{prefix}__first_token_freq"] = first_token.map(first_token.value_counts(dropna=False))
+    out[f"{prefix}__last_token_freq"] = last_token.map(last_token.value_counts(dropna=False))
+    return out
+
+
+def _infer_bool_like_columns(df: pd.DataFrame) -> list[str]:
+    bool_like = []
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_bool_dtype(s):
+            bool_like.append(col)
+            continue
+
+        vals = (
+            s.dropna()
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .unique()
+            .tolist()
+        )
+        if 0 < len(vals) <= 5 and set(vals).issubset(
+            {"true", "false", "0", "1", "yes", "no", "y", "n", "t", "f"}
+        ):
+            bool_like.append(col)
+    return bool_like
+
+
+def _normalize_bool_like(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype(int)
+
+    lowered = series.astype(str).str.strip().str.lower()
+    mapping = {
+        "true": 1,
+        "false": 0,
+        "1": 1,
+        "0": 0,
+        "yes": 1,
+        "no": 0,
+        "y": 1,
+        "n": 0,
+        "t": 1,
+        "f": 0,
+    }
+    return lowered.map(mapping)
+
+
+def _candidate_structured_string_columns(df: pd.DataFrame) -> list[str]:
+    candidates = []
+    for col in df.columns:
+        s = df[col]
+        if s.dtype != object:
+            continue
+        ss = s.dropna().astype(str).head(500)
+        if len(ss) == 0:
+            continue
+        for sep in _SEPARATORS:
+            ratio = ss.str.contains(re.escape(sep), regex=True).mean()
+            if ratio >= 0.6:
+                candidates.append(col)
+                break
+    return candidates
+
+
+def _split_structured_column(series: pd.Series, col: str) -> pd.DataFrame:
+    s = series.fillna("").astype(str)
+    out = pd.DataFrame(index=series.index)
+
+    for sep in _SEPARATORS:
+        sample = s.head(500)
+        ratio = sample.str.contains(re.escape(sep), regex=True).mean()
+        if ratio < 0.6:
+            continue
+
+        parts = s.str.split(sep, expand=True)
+        if parts.shape[1] < 2:
+            continue
+
+        base = f"{col}__split"
+        out[f"{base}_part0"] = parts[0]
+        out[f"{base}_part0_freq"] = parts[0].map(parts[0].value_counts(dropna=False))
+
+        part1_num = pd.to_numeric(parts[1], errors="coerce")
+        if part1_num.notna().mean() >= 0.5:
+            out[f"{base}_part1_num"] = part1_num
+        else:
+            out[f"{base}_part1"] = parts[1]
+            out[f"{base}_part1_freq"] = parts[1].map(parts[1].value_counts(dropna=False))
+
+        if parts.shape[1] >= 3:
+            part_last = parts[parts.shape[1] - 1]
+            out[f"{base}_last"] = part_last
+            out[f"{base}_last_freq"] = part_last.map(part_last.value_counts(dropna=False))
+            out[f"{base}_part0_last"] = parts[0].astype(str) + "__" + part_last.astype(str)
+
+        group_key = parts[0].astype(str)
+        out[f"{base}_group_size"] = group_key.map(group_key.value_counts(dropna=False))
+        break
+
+    return out
+
+
+def _infer_positive_numeric_columns(df: pd.DataFrame, max_cols: int = 12) -> list[str]:
+    numeric_cols = df.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+    selected = []
+    for col in numeric_cols:
+        s = pd.to_numeric(df[col], errors="coerce")
+        non_na = s.dropna()
+        if len(non_na) == 0:
+            continue
+        if (non_na >= 0).mean() >= 0.9:
+            selected.append(col)
+    return selected[:max_cols]
+
+
+def _make_numeric_aggregates(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    positive_numeric = _infer_positive_numeric_columns(df)
+    if not positive_numeric:
+        return out
+
+    num_frame = df[positive_numeric].apply(pd.to_numeric, errors="coerce")
+    out["__num_sum"] = num_frame.sum(axis=1)
+    out["__num_mean"] = num_frame.mean(axis=1)
+    out["__num_std"] = num_frame.std(axis=1)
+    out["__num_max"] = num_frame.max(axis=1)
+    out["__num_min"] = num_frame.min(axis=1)
+    out["__num_missing_count"] = num_frame.isna().sum(axis=1)
+    out["__num_zero_count"] = num_frame.fillna(0).eq(0).sum(axis=1)
+    out["__num_positive_count"] = num_frame.fillna(0).gt(0).sum(axis=1)
+    out["__num_log1p_sum"] = np.log1p(num_frame.clip(lower=0)).sum(axis=1)
+    return out
+
+
+def _make_group_aggregates(
+    X: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    max_group_keys: int = 3,
+    max_numeric_targets: int = 6,
+) -> pd.DataFrame:
+    out = pd.DataFrame(index=X.index)
+    structured_cols = _candidate_structured_string_columns(raw_df)
+    numeric_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()[:max_numeric_targets]
+
+    used = 0
+    for col in structured_cols:
+        if used >= max_group_keys:
+            break
+
+        s = raw_df[col].fillna("").astype(str)
+        found = False
+
+        for sep in _SEPARATORS:
+            ratio = s.head(500).str.contains(re.escape(sep), regex=True).mean()
+            if ratio < 0.6:
+                continue
+
+            parts = s.str.split(sep, expand=True)
+            if parts.shape[1] < 2:
+                continue
+
+            key = parts[0].astype(str)
+            key_name = f"{col}__groupkey"
+            out[key_name] = key
+            out[f"{key_name}__size"] = key.map(key.value_counts(dropna=False))
+
+            for num_col in numeric_cols:
+                probe = pd.DataFrame({"g": key, "v": pd.to_numeric(X[num_col], errors="coerce")})
+                grp = probe.groupby("g")["v"].agg(["mean", "max", "min"])
+                out[f"{key_name}__{num_col}__mean"] = key.map(grp["mean"])
+                out[f"{key_name}__{num_col}__max"] = key.map(grp["max"])
+                out[f"{key_name}__{num_col}__min"] = key.map(grp["min"])
+
+            used += 1
+            found = True
+            break
+
+        if found and used >= max_group_keys:
+            break
+
+    return out
+
+
+def _make_bool_numeric_interactions(
+    X: pd.DataFrame,
+    max_bool_cols: int = 4,
+    max_num_cols: int = 6,
+) -> pd.DataFrame:
+    out = pd.DataFrame(index=X.index)
+    bool_like_cols = []
+
+    for col in X.columns:
+        s = X[col]
+        vals = (
+            s.dropna().astype(str).str.strip().str.lower().unique().tolist()
+            if s.dtype == object
+            else []
+        )
+        if pd.api.types.is_bool_dtype(s):
+            bool_like_cols.append(col)
+        elif 0 < len(vals) <= 5 and set(vals).issubset({"true", "false", "0", "1", "yes", "no", "y", "n", "t", "f"}):
+            bool_like_cols.append(col)
+
+    numeric_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+    bool_like_cols = bool_like_cols[:max_bool_cols]
+    numeric_cols = numeric_cols[:max_num_cols]
+
+    for b in bool_like_cols:
+        b_num = _normalize_bool_like(X[b])
+        if b_num.isna().all():
+            continue
+
+        for n in numeric_cols:
+            n_ser = pd.to_numeric(X[n], errors="coerce")
+            out[f"{b}__x__{n}__zero"] = ((b_num == 1) & (n_ser.fillna(0) == 0)).astype(int)
+            out[f"{b}__x__{n}__missing"] = ((b_num == 1) & n_ser.isna()).astype(int)
+
+    return out
+
+
+def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+
+    for col in X.columns:
+        if _is_numeric_like_object(X[col]):
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    if "Cabin" in raw_df.columns and "Cabin" in X.columns:
+        cabin = raw_df["Cabin"].astype(str).str.split("/", expand=True)
+        if cabin.shape[1] >= 3:
+            X["CabinDeck"] = cabin[0]
+            X["CabinNum"] = pd.to_numeric(cabin[1], errors="coerce")
+            X["CabinSide"] = cabin[2]
+
+    if "PassengerId" in raw_df.columns:
+        pid = raw_df["PassengerId"].astype(str).str.split("_", expand=True)
+        if pid.shape[1] >= 2:
+            group_id = pid[0]
+            X["GroupId"] = pd.to_numeric(group_id, errors="coerce")
+            X["WithinGroupNo"] = pd.to_numeric(pid[1], errors="coerce")
+            X["PassengerGroupSize"] = group_id.map(group_id.value_counts())
+
+    if "Name" in raw_df.columns and "Name" in X.columns:
+        name_series = raw_df["Name"].astype(str)
+        X["NameLength"] = name_series.str.len()
+        X["NameWordCount"] = name_series.str.split().str.len()
+
+    spend_cols = [c for c in ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"] if c in raw_df.columns]
+    if spend_cols:
+        for c in spend_cols:
+            X[c] = pd.to_numeric(raw_df[c], errors="coerce")
+        X["TotalSpend"] = X[spend_cols].sum(axis=1)
+        X["NoSpend"] = (X["TotalSpend"].fillna(0) == 0).astype(int)
+        luxury_cols = [c for c in ["Spa", "VRDeck"] if c in X.columns]
+        if luxury_cols:
+            X["LuxurySpend"] = X[luxury_cols].sum(axis=1)
+        if "CryoSleep" in raw_df.columns:
+            cryo = raw_df["CryoSleep"].astype(str).str.lower()
+            X["CryoNoSpendMatch"] = ((cryo.isin(["true", "1"])) & (X["NoSpend"] == 1)).astype(int)
+
+    if "Age" in raw_df.columns:
+        X["Age"] = pd.to_numeric(raw_df["Age"], errors="coerce")
+        X["AgeMissing"] = X["Age"].isna().astype(int)
+        X["Age2"] = X["Age"] ** 2
+        X["IsChild"] = (X["Age"] < 18).astype(float)
+        X["IsSenior"] = (X["Age"] >= 60).astype(float)
+
+    for col in ["HomePlanet", "Destination", "VIP", "CryoSleep"]:
+        if col in raw_df.columns:
+            X[col] = raw_df[col].astype(str)
+
+    for col in _infer_bool_like_columns(X):
+        mapped = _normalize_bool_like(X[col])
+        if mapped.notna().mean() >= 0.8:
+            X[col] = mapped
+
+    numeric_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+    for col in numeric_cols[:20]:
+        X[f"{col}__is_missing"] = pd.to_numeric(X[col], errors="coerce").isna().astype(int)
+
+    for col in numeric_cols[:12]:
+        s = pd.to_numeric(X[col], errors="coerce")
+        non_na = s.dropna()
+        if len(non_na) == 0:
+            continue
+        if (non_na >= 0).mean() >= 0.9:
+            X[f"{col}__log1p"] = np.log1p(s.clip(lower=0))
+
+    object_cols = [c for c in X.columns if X[c].dtype == object]
+    for col in object_cols[:10]:
+        prof = _string_profile_features(raw_df[col] if col in raw_df.columns else X[col], col)
+        X = pd.concat([X, prof], axis=1)
+
+    for col in _candidate_structured_string_columns(raw_df)[:5]:
+        if col in raw_df.columns:
+            X = pd.concat([X, _split_structured_column(raw_df[col], col)], axis=1)
+
+    X = pd.concat([X, _make_numeric_aggregates(X)], axis=1)
+    X = pd.concat([X, _make_group_aggregates(X, raw_df)], axis=1)
+    X = pd.concat([X, _make_bool_numeric_interactions(X)], axis=1)
+
+    drop_cols = [col for col in X.columns if col.lower() in {"name", "cabin"}]
+    if drop_cols:
+        X = X.drop(columns=drop_cols, errors="ignore")
+
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X
+
+
+def align_columns(X_train: pd.DataFrame, X_test: pd.DataFrame) -> pd.DataFrame:
+    X_test = X_test.copy()
+    for col in X_train.columns:
+        if col not in X_test.columns:
+            X_test[col] = np.nan
+    extra_cols = [c for c in X_test.columns if c not in X_train.columns]
+    if extra_cols:
+        X_test = X_test.drop(columns=extra_cols)
+    return X_test[X_train.columns]
+
+
+@dataclass
+class CandidateResult:
+    name: str
+    score: float
+    model: Any
+
+
+def infer_task(train_df: pd.DataFrame, test_df: pd.DataFrame, sample_df: pd.DataFrame) -> dict[str, Any]:
+    pred_col = sample_df.columns[1]
+    id_col = sample_df.columns[0]
+
+    if pred_col in train_df.columns:
+        target_col = pred_col
+    else:
+        candidate_cols = [c for c in train_df.columns if c not in test_df.columns]
+        if len(candidate_cols) == 1:
+            target_col = candidate_cols[0]
+        else:
+            target_col = None
+            for c in ["target", "label", "Transported", "Survived", "Response", "Outcome"]:
+                if c in train_df.columns:
+                    target_col = c
+                    break
+            if target_col is None:
+                raise ValueError("Could not detect target column.")
+
+    y = train_df[target_col]
+    pred_values = sample_df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
+
+    is_bool_sample = set(pred_values).issubset({"true", "false"})
+    is_int_sample = set(pred_values).issubset({"0", "1"})
+
+    if is_bool_sample or is_int_sample:
+        task_type = "binary_classification"
+    else:
+        nunique = y.nunique(dropna=True)
+        if pd.api.types.is_numeric_dtype(y) and nunique > 20:
+            task_type = "regression"
+        elif nunique <= 20:
+            task_type = "classification"
+        else:
+            task_type = "regression"
+
+    return {
+        "target_col": target_col,
+        "id_col": id_col,
+        "pred_col": pred_col,
+        "task_type": task_type,
+        "is_bool_sample": is_bool_sample,
+        "is_int_sample": is_int_sample,
+    }
+
+
+def prepare_target(y_raw: pd.Series, task_type: str) -> tuple[pd.Series, dict[str, Any]]:
+    meta: dict[str, Any] = {"task_type": task_type}
+
+    if task_type in {"binary_classification", "classification"}:
+        lowered = y_raw.astype(str).str.strip().str.lower()
+        if set(lowered.dropna().unique()).issubset({"true", "false"}):
+            y = lowered.map({"true": 1, "false": 0}).astype(int)
+            meta["original_format"] = "bool_str"
+            meta["task_type"] = "binary_classification"
+            return y, meta
+
+        if pd.api.types.is_bool_dtype(y_raw):
+            y = y_raw.astype(int)
+            meta["original_format"] = "bool"
+            meta["task_type"] = "binary_classification"
+            return y, meta
+
+        nunique = y_raw.nunique(dropna=True)
+        if nunique == 2:
+            classes = sorted(pd.Series(y_raw.dropna().unique()).tolist(), key=lambda x: str(x))
+            mapping = {classes[0]: 0, classes[1]: 1}
+            y = y_raw.map(mapping).astype(int)
+            meta["original_format"] = "binary_generic"
+            meta["inverse_mapping"] = {0: classes[0], 1: classes[1]}
+            meta["task_type"] = "binary_classification"
+            return y, meta
+
+        classes = sorted(pd.Series(y_raw.dropna().unique()).tolist(), key=lambda x: str(x))
+        mapping = {c: i for i, c in enumerate(classes)}
+        y = y_raw.map(mapping).astype(int)
+        meta["original_format"] = "multiclass"
+        meta["inverse_mapping"] = {i: c for i, c in enumerate(classes)}
+        meta["task_type"] = "classification"
+        return y, meta
+
+    y = pd.to_numeric(y_raw, errors="coerce")
+    if y.isna().any():
+        y = y.fillna(y.median())
+    meta["original_format"] = "regression"
+    meta["task_type"] = "regression"
+    return y, meta
+
+
+def _build_preprocessors(X: pd.DataFrame) -> tuple[ColumnTransformer, ColumnTransformer]:
+    num_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+    cat_cols = [c for c in X.columns if c not in num_cols]
+
+    pre_ohe = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="median")),
+                        ("scaler", StandardScaler()),
+                    ]
+                ),
+                num_cols,
+            ),
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
+                        ("ohe", OneHotEncoder(handle_unknown="ignore", min_frequency=3)),
+                    ]
+                ),
+                cat_cols,
+            ),
+        ]
     )
 
-
-def _infer_prediction_columns(sample: pd.DataFrame, test: pd.DataFrame | None) -> list[str]:
-    if test is not None:
-        predicted = [col for col in sample.columns if col not in test.columns]
-        if predicted:
-            return predicted
-    if len(sample.columns) > 1:
-        return sample.columns[1:].tolist()
-    return sample.columns.tolist()
-
-
-def _validate_column_family(column: str, sample_series: pd.Series, submission_series: pd.Series) -> None:
-    if pdt.is_bool_dtype(sample_series):
-        invalid = submission_series.dropna().map(lambda value: str(value).lower() not in {"true", "false", "0", "1"})
-        if invalid.any():
-            raise ValueError(f"Prediction column {column!r} must be boolean-like")
-        return
-
-    if pdt.is_integer_dtype(sample_series):
-        if not pdt.is_numeric_dtype(submission_series):
-            raise ValueError(f"Prediction column {column!r} must be numeric/integer-like")
-        numeric = pd.to_numeric(submission_series, errors="coerce")
-        if numeric.isna().any():
-            raise ValueError(f"Prediction column {column!r} contains non-numeric values")
-        fractional = (numeric % 1 != 0).fillna(False)
-        if fractional.any():
-            raise ValueError(f"Prediction column {column!r} must contain integer values")
-        return
-
-    if pdt.is_float_dtype(sample_series):
-        if not pdt.is_numeric_dtype(submission_series):
-            raise ValueError(f"Prediction column {column!r} must be numeric")
-        numeric = pd.to_numeric(submission_series, errors="coerce")
-        if numeric.isna().any():
-            raise ValueError(f"Prediction column {column!r} contains non-numeric values")
-        return
-
-
-def _validate_submission_quality(
-    submission: pd.DataFrame,
-    sample: pd.DataFrame,
-    test: pd.DataFrame | None,
-) -> None:
-    if submission.empty:
-        raise ValueError("submission is empty")
-
-    if submission.isna().any().any():
-        nan_columns = submission.columns[submission.isna().any()].tolist()
-        raise ValueError(f"submission contains NaN values in columns: {nan_columns}")
-
-    id_candidates = [sample.columns[0]]
-    if test is not None:
-        shared = [col for col in sample.columns if col in test.columns]
-        if shared:
-            id_candidates = shared[:1]
-
-    for id_col in id_candidates:
-        if id_col in submission.columns and submission[id_col].duplicated().any():
-            raise ValueError(f"submission contains duplicate values in id column {id_col!r}")
-
-    prediction_columns = _infer_prediction_columns(sample, test)
-    for column in prediction_columns:
-        if column not in submission.columns:
-            raise ValueError(f"prediction column {column!r} missing after normalization")
-        _validate_column_family(column, sample[column], submission[column])
-
-
-def _patch_submission_columns(workdir: Path, submission_path: Path) -> Path:
-    data_dir = _find_data_dir(workdir)
-    sample_path = _find_first(data_dir, "sample_submission*.csv")
-    test_path = _find_first(data_dir, "test*.csv")
-
-    if not submission_path.exists() or sample_path is None:
-        return submission_path
-
-    sample = pd.read_csv(sample_path)
-    submission = pd.read_csv(submission_path)
-    test = pd.read_csv(test_path) if test_path is not None else None
-
-    if len(submission) != len(sample):
-        return submission_path
-
-    missing_columns = [col for col in sample.columns if col not in submission.columns]
-    extra_columns = [col for col in submission.columns if col not in sample.columns]
-
-    expected_prediction_columns = _infer_prediction_columns(sample, test)
-    missing_prediction_columns = [col for col in expected_prediction_columns if col not in submission.columns]
-    extra_prediction_columns = [
-        col for col in extra_columns if test is None or col not in test.columns
-    ]
-
-    if len(missing_prediction_columns) == 1 and len(extra_prediction_columns) == 1:
-        submission = submission.rename(
-            columns={extra_prediction_columns[0]: missing_prediction_columns[0]}
-        )
-        missing_columns = [col for col in sample.columns if col not in submission.columns]
-
-    for col in missing_columns:
-        if test is not None and col in test.columns:
-            submission[col] = test[col].values
-        elif col in sample.columns:
-            submission[col] = sample[col].values
-
-    if all(col in submission.columns for col in sample.columns):
-        submission = submission.loc[:, sample.columns.tolist()]
-        submission.to_csv(submission_path, index=False)
-
-    return submission_path
-
-
-def normalize_submission(workdir: Path, submission_path: Path) -> Path:
-    data_dir = _find_data_dir(workdir)
-    sample_path = _find_first(data_dir, "sample_submission*.csv")
-    test_path = _find_first(data_dir, "test*.csv")
-
-    if not submission_path.exists():
-        raise FileNotFoundError(f"submission.csv not found at {submission_path}")
-
-    if sample_path is None:
-        logger.info("No sample submission found; skipping normalization")
-        return submission_path
-
-    sample = pd.read_csv(sample_path)
-    submission = pd.read_csv(submission_path)
-    test = pd.read_csv(test_path) if test_path is not None else None
-
-    expected_rows = len(test) if test is not None else len(sample)
-    if len(submission) != expected_rows:
-        raise ValueError(
-            f"submission row count {len(submission)} does not match expected {expected_rows}"
-        )
-
-    missing_cols = [col for col in sample.columns if col not in submission.columns]
-    for col in missing_cols:
-        if test is not None and col in test.columns:
-            submission[col] = test[col].values
-        elif col in sample.columns:
-            submission[col] = sample[col].values
-        else:
-            raise ValueError(f"Cannot restore missing submission column: {col}")
-
-    still_missing = [col for col in sample.columns if col not in submission.columns]
-    if still_missing:
-        raise ValueError(f"Submission is still missing columns: {still_missing}")
-
-    submission = submission[sample.columns.tolist()]
-    _validate_submission_quality(submission, sample, test)
-    submission.to_csv(submission_path, index=False)
-    return submission_path
-
-
-@dataclass
-class ToolCall:
-    call_id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-class OpenAIResponsesClient:
-    def __init__(self, api_key: str, model: str = "gpt-5.4"):
-        self.model = model
-        self.client = OpenAI(api_key=api_key)
-
-    def create_initial_response(
-        self,
-        *,
-        system_prompt: str,
-        user_input: str,
-        tools: list[dict[str, Any]],
-    ):
-        return self.client.responses.create(
-            model=self.model,
-            instructions=system_prompt,
-            input=user_input,
-            tools=tools,
-        )
-
-    def create_followup_response(
-        self,
-        *,
-        previous_response_id: str,
-        tool_outputs: list[dict[str, str]],
-        tools: list[dict[str, Any]],
-    ):
-        return self.client.responses.create(
-            model=self.model,
-            previous_response_id=previous_response_id,
-            input=tool_outputs,
-            tools=tools,
-        )
-
-    @staticmethod
-    def extract_text(response: Any) -> str:
-        text = getattr(response, "output_text", None)
-        if text:
-            return text
-
-        chunks: list[str] = []
-        for item in getattr(response, "output", []) or []:
-            if getattr(item, "type", None) != "message":
-                continue
-            for content in getattr(item, "content", []) or []:
-                if getattr(content, "type", None) == "output_text":
-                    chunks.append(getattr(content, "text", ""))
-        return "\n".join(chunk for chunk in chunks if chunk).strip()
-
-    @staticmethod
-    def extract_tool_calls(response: Any) -> list[ToolCall]:
-        tool_calls: list[ToolCall] = []
-        for item in getattr(response, "output", []) or []:
-            if getattr(item, "type", None) != "function_call":
-                continue
-            raw_args = getattr(item, "arguments", "{}") or "{}"
-            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            tool_calls.append(
-                ToolCall(
-                    call_id=getattr(item, "call_id"),
-                    name=getattr(item, "name"),
-                    arguments=parsed_args,
-                )
-            )
-        return tool_calls
-
-
-@dataclass
-class ExecutionResult:
-    term_out: list[str]
-    exec_time: float
-    exc_type: str | None = None
-
-    @property
-    def output(self) -> str:
-        return "".join(self.term_out)
-
-    @property
-    def timed_out(self) -> bool:
-        return self.exc_type == "TimeoutError"
-
-
-class _RedirectQueue:
-    def __init__(self, q: Queue, timeout: float = 5.0):
-        self.q = q
-        self.timeout = timeout
-
-    def write(self, msg: str) -> None:
-        try:
-            self.q.put(msg, timeout=self.timeout)
-        except queue.Full:
-            pass
-
-    def flush(self) -> None:
-        pass
-
-
-def _run_session(working_dir: str, code_inq: Queue, result_outq: Queue, event_outq: Queue) -> None:
-    os.chdir(working_dir)
-    sys.path.insert(0, working_dir)
-    sys.stdout = sys.stderr = _RedirectQueue(result_outq)
-
-    global_scope: dict[str, Any] = {}
-    while True:
-        code = code_inq.get()
-        os.chdir(working_dir)
-        event_outq.put(("ready",))
-        try:
-            exec(compile(code, "<agent_code>", "exec"), global_scope)
-        except BaseException as exc:
-            lines = traceback.format_exception(exc)
-            tb_str = "".join(
-                line for line in lines if "agent.py" not in line and "importlib" not in line
-            )
-            exc_cls = type(exc).__name__
-            if exc_cls == "KeyboardInterrupt":
-                exc_cls = "TimeoutError"
-            result_outq.put(tb_str)
-            event_outq.put(("finished", exc_cls))
-        else:
-            event_outq.put(("finished", None))
-
-        result_outq.put("<|EOF|>")
-
-
-class Interpreter:
-    def __init__(self, workdir: str | Path, timeout: int = 600):
-        self.working_dir = str(Path(workdir).resolve())
-        self.timeout = timeout
-        self._process: Process | None = None
-        self._code_inq: Queue | None = None
-        self._result_outq: Queue | None = None
-        self._event_outq: Queue | None = None
-
-    def create_process(self) -> None:
-        self._code_inq = Queue()
-        self._result_outq = Queue()
-        self._event_outq = Queue()
-        self._process = Process(
-            target=_run_session,
-            args=(self.working_dir, self._code_inq, self._result_outq, self._event_outq),
-            daemon=True,
-        )
-        self._process.start()
-
-    def cleanup(self) -> None:
-        if self._process is None:
-            return
-        try:
-            self._process.terminate()
-            self._process.join(timeout=2.0)
-            if self._process.exitcode is None:
-                self._process.kill()
-                self._process.join(timeout=1.0)
-        except Exception as exc:
-            logger.error("Error cleaning up interpreter process: %s", exc)
-        finally:
-            self._process = None
-
-    def run(self, code: str, reset_session: bool = False) -> ExecutionResult:
-        if reset_session or self._process is None:
-            self.cleanup()
-            self.create_process()
-
-        assert self._process is not None and self._process.is_alive()
-        assert self._code_inq is not None
-        assert self._event_outq is not None
-        assert self._result_outq is not None
-
-        self._code_inq.put(code)
-
-        try:
-            event = self._event_outq.get(timeout=10)
-        except queue.Empty as exc:
-            raise RuntimeError("Interpreter child process failed to start execution") from exc
-        assert event[0] == "ready", event
-
-        start = time.time()
-        overtime = False
-
-        while True:
-            try:
-                event = self._event_outq.get(timeout=1.0)
-                assert event[0] == "finished", event
-                exec_time = time.time() - start
-                exc_type = event[1]
-                break
-            except queue.Empty:
-                if not overtime and not self._process.is_alive():
-                    raise RuntimeError("Interpreter process died unexpectedly")
-
-                elapsed = time.time() - start
-                if elapsed > self.timeout:
-                    logger.warning("Execution exceeded timeout of %ds", self.timeout)
-                    os.kill(self._process.pid, signal.SIGINT)
-                    overtime = True
-
-                if overtime and (time.time() - start) > self.timeout + 10:
-                    self.cleanup()
-                    exec_time = self.timeout
-                    exc_type = "TimeoutError"
-                    break
-
-        output: list[str] = []
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            try:
-                chunk = self._result_outq.get(timeout=0.5)
-                if chunk == "<|EOF|>":
-                    break
-                output.append(chunk)
-            except queue.Empty:
-                continue
-
-        if exc_type == "TimeoutError":
-            output.append(f"\nTimeoutError: execution exceeded {self.timeout}s time limit\n")
-        else:
-            output.append(f"\n[Execution time: {exec_time:.1f}s]\n")
-
-        return ExecutionResult(term_out=output, exec_time=exec_time, exc_type=exc_type)
-
-    def __del__(self) -> None:
-        self.cleanup()
-
-
-class MLAgent:
-    def __init__(
-        self,
-        workdir: str | Path,
-        api_key: str,
-        model: str = "gpt-5.4",
-        max_iterations: int = 24,
-        code_timeout: int = 600,
-        updater: TaskUpdater | None = None,
-        llm_client: OpenAIResponsesClient | None = None,
-    ):
-        self._current_work_dir: Path | None = None
-        self._current_text: str = ""
-        self._current_updater: TaskUpdater | None = None
-        self.workdir = Path(workdir).resolve()
-        self.max_iterations = max_iterations
-        self.updater = updater
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._python_session_started = False
-        self._artifact_counter = 0
-        self._artifacts: dict[str, Any] = {}
-        self.interpreter = Interpreter(workdir=self.workdir, timeout=code_timeout)
-        self.llm = llm_client or OpenAIResponsesClient(api_key=api_key, model=model)
-
-    def _post_status(self, text: str) -> None:
-        if self.updater is None or self._loop is None:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.updater.update_status(TaskState.working, new_agent_text_message(text)),
-            self._loop,
-        )
-
-    def _resolve_path(self, path: str) -> Path:
-        raw_path = Path(path or ".")
-        candidate = (self.workdir / raw_path).resolve()
-        if candidate != self.workdir and self.workdir not in candidate.parents:
-            raise ValueError(f"Path escapes workspace: {path}")
-        return candidate
-    def _parse_spec_json(self, spec_json: str) -> dict[str, Any]:
-        spec = json.loads(spec_json)
-        if not isinstance(spec, dict):
-            raise ValueError("spec_json must decode to an object")
-        return spec
-
-    def _ok_response(self, **payload: Any) -> str:
-        body = {"status": "ok", "error": None, **payload}
-        return json.dumps(body, ensure_ascii=True, separators=(",", ":"))
-
-    def _error_response(self, error: str, **payload: Any) -> str:
-        body = {"status": "error", "error": error, **payload}
-        return json.dumps(body, ensure_ascii=True, separators=(",", ":"))
-
-    def _store_artifact(self, payload: Any, prefix: str) -> str:
-        self._artifact_counter += 1
-        ref = f"{prefix}_{self._artifact_counter}"
-        self._artifacts[ref] = payload
-        return ref
-
-    def _tool_spec(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "name": "run_python",
-                "description": "Execute Python code in a persistent interpreter session.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string"},
-                    },
-                    "required": ["code"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "list_files",
-                "description": "List files and directories under a workspace-relative path.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "read_file",
-                "description": "Read a UTF-8 text file under the workspace.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "max_chars": {"type": "integer"},
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "inspect_csv",
-                "description": "Return a compact JSON summary for a CSV file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "max_rows": {"type": "integer"},
-                    },
-                    "required": ["path"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "infer_tabular_task",
-                "description": "Infer target candidates, task type, feature makeup, and recommended validation strategy.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"spec_json": {"type": "string"}},
-                    "required": ["spec_json"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": "evaluate_tabular_candidates",
-                "description": "Evaluate tabular model candidates on a shared validation strategy.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"spec_json": {"type": "string"}},
-                    "required": ["spec_json"],
-                    "additionalProperties": False,
-                },
-            },
-        ]
-
-    def _run_python(self, code: str, *, reset_session: bool = False) -> str:
-        result = self.interpreter.run(code, reset_session=reset_session)
-        clean_output = _strip_warnings(result.output)
-        return _truncate_output(clean_output, MAX_OUTPUT_CHARS)
-
-    def _list_files(self, path: str) -> str:
-        target = self._resolve_path(path)
-        if not target.exists():
-            raise FileNotFoundError(f"Path not found: {path}")
-        if target.is_file():
-            rel = target.relative_to(self.workdir)
-            return str(rel)
-
-        entries = []
-        for child in sorted(target.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
-            rel = child.relative_to(self.workdir)
-            suffix = "/" if child.is_dir() else ""
-            entries.append(f"{rel}{suffix}")
-        return "\n".join(entries) if entries else "<empty directory>"
-
-    def _read_file(self, path: str, max_chars: int = 12000) -> str:
-        target = self._resolve_path(path)
-        if not target.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-        if not target.is_file():
-            raise IsADirectoryError(f"Expected file, got directory: {path}")
-
-        suffix = target.suffix.lower()
-        size_bytes = target.stat().st_size
-        if suffix == ".csv" and size_bytes > READ_FILE_CSV_SIZE_LIMIT_BYTES:
-            raise ValueError(
-                f"Refusing to read large CSV file via read_file: {path} ({size_bytes} bytes). Use inspect_csv instead."
-            )
-        if size_bytes > READ_FILE_SIZE_LIMIT_BYTES:
-            raise ValueError(
-                f"Refusing to read large file via read_file: {path} ({size_bytes} bytes). Use inspect_csv for CSVs or request a smaller text file."
-            )
-
-        text = target.read_text(encoding="utf-8")
-        return _truncate_output(text, max(200, min(max_chars, MAX_READ_FILE_CHARS)))
-
-    def _inspect_csv(self, path: str, max_rows: int = 5) -> str:
-        target = self._resolve_path(path)
-        if not target.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-        if not target.is_file():
-            raise IsADirectoryError(f"Expected file, got directory: {path}")
-
-        frame = pd.read_csv(target)
-        preview_rows = frame.head(max(1, min(max_rows, 20))).to_dict(orient="records")
-        summary = {
-            "path": str(target.relative_to(self.workdir)),
-            "rows": int(len(frame)),
-            "columns": frame.columns.tolist(),
-            "dtypes": {col: str(dtype) for col, dtype in frame.dtypes.items()},
-            "preview": preview_rows,
-        }
-        return _truncate_output(json.dumps(summary, ensure_ascii=True, indent=2), MAX_OUTPUT_CHARS)
-
-    def _load_tabular_bundle(self, spec: dict[str, Any]):
-        train = pd.read_csv(self._resolve_path(str(spec["train_path"])))
-        test_path = spec.get("test_path")
-        sample_path = spec.get("sample_submission_path")
-        test = pd.read_csv(self._resolve_path(str(test_path))) if test_path else None
-        sample = pd.read_csv(self._resolve_path(str(sample_path))) if sample_path else None
-        return train, test, sample
-
-    def _infer_target_candidates(self, train, test, sample) -> list[str]:
-        if sample is not None and test is not None:
-            sample_only = [col for col in sample.columns if col not in test.columns]
-            if sample_only:
-                return sample_only
-        if test is not None:
-            train_only = [col for col in train.columns if col not in test.columns]
-            if train_only:
-                return train_only
-        return train.columns[-1:].tolist()
-
-    def _infer_id_candidates(self, train, test, sample) -> list[str]:
-        candidates: list[str] = []
-        if test is not None and sample is not None:
-            candidates.extend([col for col in sample.columns if col in test.columns])
-        if test is not None:
-            for col in test.columns:
-                lower = str(col).lower()
-                if lower.endswith("id") or lower == "id":
-                    candidates.append(col)
-        seen = set()
-        ordered = []
-        for item in candidates:
-            if item not in seen:
-                ordered.append(item)
-                seen.add(item)
-        return ordered[:5]
-
-    def _detect_text_datetime_features(self, frame, exclude: set[str]) -> tuple[dict[str, Any], bool, bool]:
-        numeric_cols = []
-        categorical_cols = []
-        text_cols = []
-        datetime_cols = []
-
-        for column in frame.columns:
-            if column in exclude:
-                continue
-            series = frame[column]
-            if str(series.dtype).startswith(("int", "float", "bool")):
-                numeric_cols.append(column)
-                continue
-            categorical_cols.append(column)
-            sample = series.dropna().astype(str).head(100)
-            avg_len = float(sample.str.len().mean()) if not sample.empty else 0.0
-            if avg_len >= 20.0:
-                text_cols.append(column)
-            parsed = None
-            try:
-                parsed = pd.to_datetime(sample, errors="coerce")
-            except Exception:
-                parsed = None
-            if parsed is not None and len(sample) > 0 and float(parsed.notna().mean()) >= 0.8:
-                datetime_cols.append(column)
-
-        feature_summary = {
-            "numeric_columns": numeric_cols,
-            "categorical_columns": categorical_cols,
-            "text_columns": text_cols,
-            "datetime_columns": datetime_cols,
-            "column_count": int(len(frame.columns) - len(exclude)),
-        }
-        return feature_summary, bool(text_cols), bool(datetime_cols)
-
-    def _infer_task_type_from_target(self, target_series) -> str:
-        if target_series.dtype == object or str(target_series.dtype).startswith("string"):
-            nunique = int(target_series.nunique(dropna=True))
-            return "binary_classification" if nunique <= 2 else "multiclass_classification"
-        if pd.api.types.is_bool_dtype(target_series):
-            return "binary_classification"
-        if pd.api.types.is_integer_dtype(target_series):
-            nunique = int(target_series.nunique(dropna=True))
-            if nunique <= 20:
-                return "binary_classification" if nunique <= 2 else "multiclass_classification"
-        return "regression"
-
-    def _recommended_metric_family(self, task_type: str) -> str:
-        if task_type in {"binary_classification", "multiclass_classification"}:
-            return "accuracy"
-        return "neg_rmse"
-
-    def _recommended_validation(self, task_type: str, datetime_heavy: bool, group_candidates: list[str]) -> str:
-        if datetime_heavy:
-            return "time_split"
-        if group_candidates:
-            return "grouped_kfold_recommended"
-        if "classification" in task_type:
-            return "stratified_kfold"
-        return "kfold"
-
-    def _infer_tabular_task(self, spec_json: str) -> str:
-        try:
-            spec = self._parse_spec_json(spec_json)
-            train, test, sample = self._load_tabular_bundle(spec)
-            target_candidates = self._infer_target_candidates(train, test, sample)
-            id_candidates = self._infer_id_candidates(train, test, sample)
-            chosen_target = str(spec.get("target_column") or target_candidates[0])
-            exclude = set(id_candidates + [chosen_target])
-            feature_summary, text_heavy, datetime_heavy = self._detect_text_datetime_features(train, exclude)
-            task_type = str(spec.get("task_type") or self._infer_task_type_from_target(train[chosen_target]))
-            validation = self._recommended_validation(task_type, datetime_heavy, id_candidates)
-            return self._ok_response(
-                task_type=task_type,
-                target_candidates=target_candidates,
-                id_candidates=id_candidates,
-                feature_summary=feature_summary,
-                recommended_validation=validation,
-                recommended_metric_family=self._recommended_metric_family(task_type),
-                text_heavy=text_heavy,
-                datetime_heavy=datetime_heavy,
-                available_candidates={
-                    "binary_classification": [
-                        "logistic_regression",
-                        "lightgbm_classifier",
-                        "catboost_classifier",
-                        "xgboost_classifier",
-                    ],
-                    "multiclass_classification": [
-                        "logistic_regression",
-                        "lightgbm_classifier",
-                        "catboost_classifier",
-                        "xgboost_classifier",
-                    ],
-                    "regression": [
-                        "linear_regression",
-                        "lightgbm_regressor",
-                        "catboost_regressor",
-                        "xgboost_regressor",
-                    ],
-                    "text_heavy_tabular": ["tfidf_linear", "logistic_regression", "lightgbm_classifier"],
-                },
-            )
-        except Exception as exc:
-            return self._error_response(str(exc))
-
-    def _default_candidates(self, task_type: str, text_heavy: bool) -> list[str]:
-        if task_type == "regression":
-            return ["linear_regression", "lightgbm_regressor"]
-        if text_heavy:
-            return ["tfidf_linear", "logistic_regression", "lightgbm_classifier"]
-        return ["logistic_regression", "lightgbm_classifier"]
-
-    def _is_large_tabular_dataset(self, frame) -> bool:
-        rows = int(len(frame))
-        cols = int(len(frame.columns))
-        return rows >= LARGE_TABULAR_ROWS or rows * max(cols, 1) >= LARGE_TABULAR_CELLS
-
-    def _subsample_training_frame(self, train, target_column: str, task_type: str):
-        if not self._is_large_tabular_dataset(train) or len(train) <= EVAL_SUBSAMPLE_ROWS:
-            return train, False
-
-        if "classification" in task_type and target_column in train.columns:
-            grouped = []
-            target = train[target_column]
-            for _, group in train.groupby(target, dropna=False):
-                take = max(1, int(round(len(group) / len(train) * EVAL_SUBSAMPLE_ROWS)))
-                grouped.append(group.sample(n=min(len(group), take), random_state=42))
-            sampled = pd.concat(grouped, axis=0).sample(frac=1.0, random_state=42)
-            if len(sampled) > EVAL_SUBSAMPLE_ROWS:
-                sampled = sampled.head(EVAL_SUBSAMPLE_ROWS)
-            return sampled.reset_index(drop=True), True
-
-        sampled = train.sample(n=EVAL_SUBSAMPLE_ROWS, random_state=42)
-        return sampled.reset_index(drop=True), True
-
-    def _apply_feature_plan(self, train_df, test_df, feature_plan: dict[str, Any], target_column: str):
-        import numpy as np
-
-        train = train_df.copy()
-        test = test_df.copy() if test_df is not None else None
-        transforms = feature_plan.get("transforms_applied", [])
-
-        for col in feature_plan.get("missing_indicators", []):
-            if col in train.columns:
-                train[f"{col}__is_missing"] = train[col].isna().astype(int)
-                if test is not None and col in test.columns:
-                    test[f"{col}__is_missing"] = test[col].isna().astype(int)
-
-        for col in feature_plan.get("datetime_parts", []):
-            if col in train.columns:
-                tr = pd.to_datetime(train[col], errors="coerce")
-                train[f"{col}__year"] = tr.dt.year
-                train[f"{col}__month"] = tr.dt.month
-                train[f"{col}__day"] = tr.dt.day
-                if test is not None and col in test.columns:
-                    te = pd.to_datetime(test[col], errors="coerce")
-                    test[f"{col}__year"] = te.dt.year
-                    test[f"{col}__month"] = te.dt.month
-                    test[f"{col}__day"] = te.dt.day
-
-        for col in feature_plan.get("log1p_columns", []):
-            if col in train.columns:
-                train[col] = pd.to_numeric(train[col], errors="coerce")
-                train[f"{col}__log1p"] = np.log1p(train[col].clip(lower=0))
-                if test is not None and col in test.columns:
-                    test[col] = pd.to_numeric(test[col], errors="coerce")
-                    test[f"{col}__log1p"] = np.log1p(test[col].clip(lower=0))
-
-        for col in feature_plan.get("frequency_encode", []):
-            if col in train.columns:
-                freq = train[col].astype(str).value_counts(dropna=False).to_dict()
-                train[f"{col}__freq"] = train[col].astype(str).map(freq).fillna(0)
-                if test is not None and col in test.columns:
-                    test[f"{col}__freq"] = test[col].astype(str).map(freq).fillna(0)
-
-        if target_column in train.columns:
-            train[target_column] = train_df[target_column]
-
-        return train, test, transforms
-
-    def _build_candidate_model(self, candidate_name: str, task_type: str, X, text_column: str | None):
-        from sklearn.compose import ColumnTransformer
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.impute import SimpleImputer
-        from sklearn.linear_model import LinearRegression, LogisticRegression
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
-
-        numeric_cols = X.select_dtypes(include=["number", "bool"]).columns.tolist()
-        categorical_cols = [col for col in X.columns if col not in numeric_cols]
-        large_dataset = self._is_large_tabular_dataset(X)
-        low_memory_categoricals = large_dataset or len(categorical_cols) >= 8
-
-        def _tabular_preprocessor(scale_numeric: bool) -> ColumnTransformer:
-            numeric_steps = [("impute", SimpleImputer(strategy="median"))]
-            if scale_numeric:
-                numeric_steps.append(("scale", StandardScaler()))
-            transformers = []
-            if numeric_cols:
-                transformers.append(("num", Pipeline(numeric_steps), numeric_cols))
-            if categorical_cols:
-                if low_memory_categoricals:
-                    cat_steps = [
-                        ("impute", SimpleImputer(strategy="most_frequent")),
+    pre_ord = ColumnTransformer(
+        transformers=[
+            (
+                "num",
+                Pipeline([("imputer", SimpleImputer(strategy="median"))]),
+                num_cols,
+            ),
+            (
+                "cat",
+                Pipeline(
+                    [
+                        ("imputer", SimpleImputer(strategy="most_frequent")),
                         (
                             "ord",
                             OrdinalEncoder(
                                 handle_unknown="use_encoded_value",
                                 unknown_value=-1,
-                                encoded_missing_value=-1,
                             ),
                         ),
                     ]
-                else:
-                    cat_steps = [
-                        ("impute", SimpleImputer(strategy="most_frequent")),
-                        (
-                            "oh",
-                            OneHotEncoder(
-                                handle_unknown="ignore",
-                                min_frequency=10 if large_dataset else None,
-                            ),
-                        ),
-                    ]
-                transformers.append(("cat", Pipeline(cat_steps), categorical_cols))
-            return ColumnTransformer(transformers, remainder="drop")
-
-        if candidate_name == "logistic_regression":
-            estimator = LogisticRegression(max_iter=250, solver="lbfgs")
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=True)), ("model", estimator)])
-        if candidate_name == "linear_regression":
-            estimator = __import__("sklearn.linear_model").linear_model.LinearRegression()
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=True)), ("model", estimator)])
-        if candidate_name == "lightgbm_classifier":
-            from lightgbm import LGBMClassifier
-
-            estimator = LGBMClassifier(
-                n_estimators=80 if large_dataset else 120,
-                learning_rate=0.07,
-                num_leaves=31,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                n_jobs=1,
-                random_state=42,
-                verbose=-1,
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "lightgbm_regressor":
-            from lightgbm import LGBMRegressor
-
-            estimator = LGBMRegressor(
-                n_estimators=80 if large_dataset else 120,
-                learning_rate=0.07,
-                num_leaves=31,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                n_jobs=1,
-                random_state=42,
-                verbose=-1,
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "xgboost_classifier":
-            from xgboost import XGBClassifier
-
-            estimator = XGBClassifier(
-                n_estimators=80 if large_dataset else 120,
-                learning_rate=0.07,
-                max_depth=4,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                n_jobs=1,
-                tree_method="hist",
-                random_state=42,
-                verbosity=0,
-                eval_metric="logloss",
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "xgboost_regressor":
-            from xgboost import XGBRegressor
-
-            estimator = XGBRegressor(
-                n_estimators=80 if large_dataset else 120,
-                learning_rate=0.07,
-                max_depth=4,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                n_jobs=1,
-                tree_method="hist",
-                random_state=42,
-                verbosity=0,
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "catboost_classifier":
-            from catboost import CatBoostClassifier
-
-            estimator = CatBoostClassifier(
-                iterations=80 if large_dataset else 120,
-                learning_rate=0.07,
-                depth=5,
-                thread_count=1,
-                verbose=False,
-                allow_writing_files=False,
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "catboost_regressor":
-            from catboost import CatBoostRegressor
-
-            estimator = CatBoostRegressor(
-                iterations=80 if large_dataset else 120,
-                learning_rate=0.07,
-                depth=5,
-                thread_count=1,
-                verbose=False,
-                allow_writing_files=False,
-            )
-            return Pipeline([("pre", _tabular_preprocessor(scale_numeric=False)), ("model", estimator)])
-        if candidate_name == "tfidf_linear":
-            if text_column is None:
-                raise ValueError("tfidf_linear requires a text column")
-            if task_type == "regression":
-                from sklearn.linear_model import LinearRegression
-
-                estimator = LinearRegression()
-            else:
-                estimator = LogisticRegression(max_iter=500)
-            return Pipeline(
-                [
-                    (
-                        "features",
-                        __import__("sklearn.compose").compose.ColumnTransformer(
-                            [
-                                ("text", __import__("sklearn.feature_extraction.text").feature_extraction.text.TfidfVectorizer(max_features=5000, ngram_range=(1, 2)), text_column),
-                            ],
-                            remainder="drop",
-                        ),
-                    ),
-                    ("model", estimator),
-                ]
-            )
-        raise ValueError(f"Unsupported candidate: {candidate_name}")
-
-    def _normalize_candidate_name(self, candidate: Any) -> str:
-        if isinstance(candidate, str):
-            raw_name = candidate
-        elif isinstance(candidate, dict):
-            raw_name = ""
-            for key in ("candidate_name", "model", "model_type", "name"):
-                value = candidate.get(key)
-                if isinstance(value, str) and value:
-                    raw_name = value
-                    break
-            if not raw_name:
-                raise ValueError(f"Unsupported candidate: {candidate}")
-        else:
-            raise ValueError(f"Unsupported candidate: {candidate}")
-
-        aliases = {
-            "logreg": "logistic_regression",
-            "logistic": "logistic_regression",
-            "linear": "linear_regression",
-            "lgbm": "lightgbm_classifier",
-            "lightgbm": "lightgbm_classifier",
-            "catboost": "catboost_classifier",
-            "xgboost": "xgboost_classifier",
-            "tfidf": "tfidf_linear",
-        }
-        return aliases.get(raw_name, raw_name)
-
-    def _evaluate_tabular_candidates(self, spec_json: str) -> str:
-        try:
-            from sklearn.metrics import accuracy_score, mean_squared_error
-            from sklearn.model_selection import KFold, StratifiedKFold, TimeSeriesSplit
-
-            spec = self._parse_spec_json(spec_json)
-            train, test, sample = self._load_tabular_bundle(spec)
-            target_candidates = self._infer_target_candidates(train, test, sample)
-            target_column = str(spec.get("target_column") or target_candidates[0])
-            task_type = str(spec.get("task_type") or self._infer_task_type_from_target(train[target_column]))
-            train_eval_source, used_subsample = self._subsample_training_frame(train, target_column, task_type)
-
-            id_candidates = self._infer_id_candidates(train, test, sample)
-            feature_summary, text_heavy, datetime_heavy = self._detect_text_datetime_features(
-                train_eval_source, set(id_candidates + [target_column])
-            )
-            validation_scheme = str(spec.get("validation_scheme") or self._recommended_validation(task_type, datetime_heavy, id_candidates))
-            metric_family = str(spec.get("metric_family") or self._recommended_metric_family(task_type))
-            feature_plan = spec.get("feature_plan") or {}
-
-            train_eval, test_eval, transforms = self._apply_feature_plan(train_eval_source, test, feature_plan, target_column)
-            X = train_eval.drop(columns=[target_column], errors="ignore")
-            X = X.drop(columns=[col for col in id_candidates if col in X.columns], errors="ignore")
-            X_test = None
-            if test_eval is not None:
-                X_test = test_eval.drop(columns=[col for col in id_candidates if col in test_eval.columns], errors="ignore")
-
-            y = train_eval[target_column]
-            text_column = feature_summary["text_columns"][0] if feature_summary["text_columns"] else None
-            raw_candidates = spec.get("candidates") or self._default_candidates(task_type, text_heavy)
-            candidate_names = [self._normalize_candidate_name(candidate) for candidate in raw_candidates]
-            n_splits = int(spec.get("n_splits", 3))
-
-            if validation_scheme == "time_split":
-                splitter = TimeSeriesSplit(n_splits=max(2, n_splits))
-                split_iter = splitter.split(X)
-            elif "classification" in task_type:
-                split_iter = StratifiedKFold(n_splits=max(2, n_splits), shuffle=True, random_state=42).split(X, y)
-            else:
-                split_iter = KFold(n_splits=max(2, n_splits), shuffle=True, random_state=42).split(X, y)
-
-            split_indices = list(split_iter)
-            candidates_out = []
-            best_candidate = None
-            best_score = None
-            prediction_mode = "numeric" if task_type == "regression" else "label"
-
-            for candidate_name in candidate_names:
-                candidate_model = self._build_candidate_model(candidate_name, task_type, X, text_column)
-                fold_scores: list[float] = []
-                oof_predictions: list[Any] = [None] * len(X)
-                oof_probabilities: list[Any] | None = [None] * len(X) if task_type == "binary_classification" else None
-
-                for train_idx, valid_idx in split_indices:
-                    X_tr = X.iloc[train_idx]
-                    X_va = X.iloc[valid_idx]
-                    y_tr = y.iloc[train_idx]
-                    y_va = y.iloc[valid_idx]
-                    candidate_model.fit(X_tr, y_tr)
-
-                    if task_type == "regression":
-                        pred = candidate_model.predict(X_va)
-                        score = -float(mean_squared_error(y_va, pred) ** 0.5)
-                        for local_idx, value in zip(valid_idx, pred):
-                            oof_predictions[local_idx] = float(value)
-                    elif task_type == "binary_classification":
-                        if hasattr(candidate_model, "predict_proba"):
-                            proba = candidate_model.predict_proba(X_va)[:, 1]
-                            pred = (proba >= 0.5).astype(int)
-                        else:
-                            pred = candidate_model.predict(X_va)
-                            proba = pred.astype(float)
-                        score = float(accuracy_score(y_va, pred))
-                        prediction_mode = "proba"
-                        for local_idx, p_val, y_val in zip(valid_idx, proba, pred):
-                            oof_probabilities[local_idx] = float(p_val)
-                            oof_predictions[local_idx] = int(y_val)
-                    else:
-                        pred = candidate_model.predict(X_va)
-                        score = float(accuracy_score(y_va, pred))
-                        for local_idx, value in zip(valid_idx, pred):
-                            oof_predictions[local_idx] = value.item() if hasattr(value, "item") else value
-
-                    fold_scores.append(score)
-
-                candidate_model.fit(X, y)
-                test_output = None
-                test_probability = None
-                if X_test is not None:
-                    if task_type == "regression":
-                        pred = candidate_model.predict(X_test)
-                        test_output = [float(item) for item in pred]
-                    elif task_type == "binary_classification":
-                        if hasattr(candidate_model, "predict_proba"):
-                            test_probability = candidate_model.predict_proba(X_test)[:, 1]
-                            test_output = [int(item) for item in (test_probability >= 0.5)]
-                            test_probability = [float(item) for item in test_probability]
-                        else:
-                            pred = candidate_model.predict(X_test)
-                            test_output = [int(item) for item in pred]
-                    else:
-                        pred = candidate_model.predict(X_test)
-                        test_output = [item.item() if hasattr(item, "item") else item for item in pred]
-
-                artifact_ref = self._store_artifact(
-                    {
-                        "task_type": task_type,
-                        "metric_family": metric_family,
-                        "candidate_name": candidate_name,
-                        "validation_scheme": validation_scheme,
-                        "y_true": [item.item() if hasattr(item, "item") else item for item in y.tolist()],
-                        "oof_predictions": oof_predictions,
-                        "oof_probabilities": oof_probabilities,
-                        "test_predictions": test_output,
-                        "test_probabilities": test_probability,
-                        "feature_plan": feature_plan,
-                        "target_column": target_column,
-                        "id_candidates": id_candidates,
-                        "used_subsample_for_eval": used_subsample,
-                        "eval_rows": int(len(train_eval)),
-                    },
-                    "candidate",
-                )
-
-                candidate_result = {
-                    "name": candidate_name,
-                    "score": float(sum(fold_scores) / len(fold_scores)),
-                    "fold_scores": [float(score) for score in fold_scores],
-                    "artifact_ref": artifact_ref,
-                    "fit_notes": [],
-                }
-                candidates_out.append(candidate_result)
-
-                if best_score is None or candidate_result["score"] > best_score:
-                    best_score = candidate_result["score"]
-                    best_candidate = candidate_result
-
-            candidates_out.sort(key=lambda item: item["score"], reverse=True)
-            return self._ok_response(
-                task_type=task_type,
-                validation_scheme=validation_scheme,
-                metric_family=metric_family,
-                candidates=candidates_out,
-                best_candidate=best_candidate,
-                oof_available=True,
-                prediction_mode=prediction_mode,
-                feature_policy={"applied": transforms, "feature_plan": feature_plan},
-                text_heavy=text_heavy,
-                datetime_heavy=datetime_heavy,
-                used_subsample_for_eval=used_subsample,
-                eval_rows=int(len(train_eval)),
-            )
-        except Exception as exc:
-            return self._error_response(str(exc))
-
-    def _execute_tool(self, call, *, iteration: int, index: int) -> str:
-        try:
-            if call.name == "run_python":
-                code = str(call.arguments.get("code", ""))
-                preview = code.strip().splitlines()[0][:100] if code.strip() else "<empty>"
-                self._post_status(f"run_python: {preview}")
-                reset_session = not self._python_session_started
-                output = self._run_python(code, reset_session=reset_session)
-                self._python_session_started = True
-                return output
-            if call.name == "list_files":
-                path = str(call.arguments.get("path", "."))
-                self._post_status(f"list_files: {path}")
-                return self._list_files(path)
-            if call.name == "read_file":
-                path = str(call.arguments.get("path", ""))
-                max_chars = int(call.arguments.get("max_chars", 12000))
-                self._post_status(f"read_file: {path}")
-                return self._read_file(path, max_chars=max_chars)
-            if call.name == "inspect_csv":
-                path = str(call.arguments.get("path", ""))
-                max_rows = int(call.arguments.get("max_rows", 5))
-                self._post_status(f"inspect_csv: {path}")
-                return self._inspect_csv(path, max_rows=max_rows)
-            if call.name == "infer_tabular_task":
-                self._post_status("infer_tabular_task")
-                return self._infer_tabular_task(str(call.arguments.get("spec_json", "{}")))
-            if call.name == "evaluate_tabular_candidates":
-                self._post_status("evaluate_tabular_candidates")
-                return self._evaluate_tabular_candidates(str(call.arguments.get("spec_json", "{}")))
-            raise ValueError(f"Unsupported tool call: {call.name}")
-        except Exception as exc:
-            logger.warning("Tool call failed (%s): %s", call.name, exc)
-            error_hint = ""
-            if call.name == "read_file":
-                error_hint = " Use inspect_csv for CSV files, especially sample_submission.csv, train.csv, and test.csv."
-            return self._error_response(
-                str(exc) + error_hint,
-                tool_name=call.name,
-                iteration=iteration,
-                tool_index=index,
-            )
-
-    def _finalize_submission_if_possible(self) -> Path | None:
-        submission = self.workdir / "submission.csv"
-        finalizer_code = '''
-from pathlib import Path
-import json
-import pandas as pd
-
-workdir = Path(".")
-submission_path = workdir / "submission.csv"
-data_dir = workdir / "home" / "data"
-if not data_dir.exists():
-    data_dir = workdir
-
-sample_candidates = sorted(data_dir.glob("sample_submission*.csv"))
-test_candidates = sorted(data_dir.glob("test*.csv"))
-sample_path = sample_candidates[0] if sample_candidates else None
-test_path = test_candidates[0] if test_candidates else None
-
-def _expected_rows(sample_df, test_df):
-    return len(test_df) if test_df is not None else len(sample_df)
-
-sample_df = pd.read_csv(sample_path) if sample_path is not None else None
-test_df = pd.read_csv(test_path) if test_path is not None else None
-
-if not submission_path.exists():
-    namespace = globals()
-    chosen_df = None
-
-    if sample_df is not None:
-        expected_rows = _expected_rows(sample_df, test_df)
-        preferred_names = [
-            "submission",
-            "submission_df",
-            "predictions_df",
-            "pred_df",
-            "result_df",
-            "output_df",
-            "final_submission",
+                ),
+                cat_cols,
+            ),
         ]
-        for name in preferred_names + sorted(namespace.keys()):
-            obj = namespace.get(name)
-            if isinstance(obj, pd.DataFrame) and len(obj) == expected_rows:
-                chosen_df = obj.copy()
-                break
+    )
 
-        if chosen_df is None:
-            for name in ["predictions", "preds", "y_pred", "test_predictions"]:
-                obj = namespace.get(name)
-                if obj is None:
-                    continue
-                try:
-                    values = list(obj)
-                except Exception:
-                    continue
-                if len(values) == expected_rows and len(sample_df.columns) >= 2:
-                    chosen_df = sample_df.copy()
-                    chosen_df[sample_df.columns[-1]] = values
-                    break
+    return pre_ohe, pre_ord
 
-    if chosen_df is not None:
-        chosen_df.to_csv(submission_path, index=False)
 
-summary = {"exists": submission_path.exists(), "path": str(submission_path)}
-if submission_path.exists():
-    preview_df = pd.read_csv(submission_path)
-    summary["rows"] = int(len(preview_df))
-    summary["columns"] = preview_df.columns.tolist()
-print(json.dumps(summary, ensure_ascii=True))
-'''
+def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
+    pre_ohe, pre_ord = _build_preprocessors(X)
+    candidates: list[tuple[str, Any]] = []
+
+    if task_type == "binary_classification":
+        candidates.extend(
+            [
+                (
+                    "logreg_ohe",
+                    Pipeline(
+                        [
+                            ("pre", pre_ohe),
+                            ("model", LogisticRegression(max_iter=4000, C=1.2, solver="liblinear", random_state=42)),
+                        ]
+                    ),
+                ),
+                (
+                    "extratrees_ohe",
+                    Pipeline(
+                        [
+                            ("pre", pre_ohe),
+                            ("model", ExtraTreesClassifier(n_estimators=600, random_state=42, n_jobs=-1)),
+                        ]
+                    ),
+                ),
+                (
+                    "rf_ohe",
+                    Pipeline(
+                        [
+                            ("pre", pre_ohe),
+                            ("model", RandomForestClassifier(n_estimators=500, max_depth=18, min_samples_leaf=2, random_state=42, n_jobs=-1)),
+                        ]
+                    ),
+                ),
+                (
+                    "hgb_ordinal_main",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            ("model", HistGradientBoostingClassifier(learning_rate=0.04, max_depth=8, max_iter=350, random_state=42)),
+                        ]
+                    ),
+                ),
+                (
+                    "hgb_ordinal_alt",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            ("model", HistGradientBoostingClassifier(learning_rate=0.03, max_depth=10, max_iter=500, random_state=42)),
+                        ]
+                    ),
+                ),
+            ]
+        )
+    elif task_type == "classification":
+        candidates.extend(
+            [
+                ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=3000, random_state=42))])),
+                ("extratrees_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesClassifier(n_estimators=600, random_state=42, n_jobs=-1))])),
+                ("hgb_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingClassifier(max_iter=350, random_state=42))])),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                ("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))])),
+                ("extratrees_reg_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesRegressor(n_estimators=600, random_state=42, n_jobs=-1))])),
+                ("rf_reg_ohe", Pipeline([("pre", pre_ohe), ("model", RandomForestRegressor(n_estimators=500, random_state=42, n_jobs=-1))])),
+                ("hgb_reg_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingRegressor(max_iter=350, random_state=42))])),
+            ]
+        )
+
+    return candidates
+
+
+def evaluate_candidates(
+    X: pd.DataFrame,
+    y: pd.Series,
+    candidates: list[tuple[str, Any]],
+    task_type: str,
+    logs: list[str],
+) -> list[CandidateResult]:
+    results: list[CandidateResult] = []
+
+    if task_type in {"binary_classification", "classification"}:
+        cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        scoring = "accuracy"
+    else:
+        cv = KFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        scoring = make_scorer(lambda yt, yp: -float(np.sqrt(mean_squared_error(yt, yp))), greater_is_better=True)
+
+    for name, model in candidates:
         try:
-            output = self._run_python(finalizer_code, reset_session=not self._python_session_started)
-            self._python_session_started = True
-            logger.info("Deterministic finalizer output: %s", output)
-        except Exception as exc:
-            logger.warning("Deterministic finalizer failed: %s", exc)
-        return submission if submission.exists() else None
+            scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+            score = float(np.mean(scores))
+            results.append(CandidateResult(name=name, score=score, model=model))
+            logs.append(f"{name}: {score:.6f}")
+        except Exception as e:
+            logs.append(f"{name}: FAILED ({e})")
 
-    def run(self, instructions: str, loop: asyncio.AbstractEventLoop | None = None) -> Path | None:
-        self._loop = loop
-        self._python_session_started = False
-        tools = self._tool_spec()
+    if not results:
+        raise RuntimeError("All candidate models failed.")
 
+    results.sort(key=lambda r: r.score, reverse=True)
+    return results
+
+
+def _apply_soft_group_consensus(
+    probabilities: np.ndarray,
+    group_values: pd.Series,
+    logs: list[str] | None = None,
+    log_prefix: str = "soft_group_consensus",
+) -> np.ndarray:
+    if len(group_values) != len(probabilities):
+        if logs is not None:
+            logs.append(f"{log_prefix}: skipped (length mismatch)")
+        return probabilities
+
+    out = probabilities.copy()
+    group_id = group_values.astype(str).str.split("_", n=1).str[0]
+
+    probe = pd.DataFrame({"g": group_id, "p": out})
+    stats = probe.groupby("g")["p"].agg(["mean", "count"])
+
+    mean_map = probe["g"].map(stats["mean"]).to_numpy()
+    count_map = probe["g"].map(stats["count"]).to_numpy()
+
+    strong_high = (count_map >= 2) & (mean_map >= 0.88)
+    strong_low = (count_map >= 2) & (mean_map <= 0.12)
+
+    out[strong_high] = np.maximum(out[strong_high], 0.90)
+    out[strong_low] = np.minimum(out[strong_low], 0.10)
+
+    if logs is not None:
+        changed = int(strong_high.sum() + strong_low.sum())
+        logs.append(f"{log_prefix}: adjusted_rows={changed}")
+
+    return out
+
+
+def _predict_binary_with_blend(
+    ranked_results: list[CandidateResult],
+    X_train: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    test_df: pd.DataFrame,
+    logs: list[str],
+) -> np.ndarray:
+    top = ranked_results[:4]
+    proba_preds: list[np.ndarray] = []
+    weights: list[float] = []
+
+    for r in top:
+        model = clone(r.model)
         try:
-            self._post_status(f"Starting ML agent with model={self.llm.model}")
-            response = self.llm.create_initial_response(
-                system_prompt=SYSTEM_PROMPT,
-                user_input=instructions or "Solve the competition and produce ./submission.csv",
-                tools=tools,
-            )
-
-            for iteration in range(1, self.max_iterations + 1):
-                tool_calls = self.llm.extract_tool_calls(response)
-                if not tool_calls:
-                    final_text = self.llm.extract_text(response)
-                    if final_text:
-                        logger.info("LLM finished: %s", final_text)
-                    break
-
-                self._post_status(f"Iteration {iteration}/{self.max_iterations}: executing tool calls")
-                tool_outputs: list[dict[str, str]] = []
-                for index, call in enumerate(tool_calls):
-                    output = self._execute_tool(call, iteration=iteration, index=index)
-                    logger.info("Tool output (%s): %s", call.name, output[:500])
-                    tool_outputs.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": call.call_id,
-                            "output": output,
-                        }
-                    )
-
-                response = self.llm.create_followup_response(
-                    previous_response_id=response.id,
-                    tool_outputs=tool_outputs,
-                    tools=tools,
-                )
+            model.fit(X_train, y)
+            if hasattr(model, "predict_proba"):
+                p = model.predict_proba(X_test)[:, 1]
             else:
-                logger.warning("Max iterations reached without explicit finish")
+                pred = model.predict(X_test)
+                p = np.asarray(pred, dtype=float)
+            proba_preds.append(p)
+            weight = max(1e-6, float(r.score)) ** 2
+            weights.append(weight)
+            logs.append(f"blend_member: {r.name} weight={weight:.6f}")
+        except Exception as e:
+            logs.append(f"blend_member_failed: {r.name} ({e})")
 
-            submission = self.workdir / "submission.csv"
-            if not submission.exists():
-                self._post_status("Finalizing submission.csv deterministically")
-                self._finalize_submission_if_possible()
-        finally:
-            self.interpreter.cleanup()
+    if not proba_preds:
+        best = clone(ranked_results[0].model)
+        best.fit(X_train, y)
+        if hasattr(best, "predict_proba"):
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+        return best.predict(X_test)
 
-        submission = self.workdir / "submission.csv"
-        return submission if submission.exists() else None
+    matrix = np.column_stack(proba_preds)
+    blend_proba = np.average(matrix, axis=1, weights=np.array(weights))
+
+    if test_df.shape[1] > 0:
+        for col in test_df.columns:
+            s = test_df[col]
+            if s.dtype == object:
+                sample = s.dropna().astype(str).head(300)
+                if len(sample) > 0 and sample.str.contains("_").mean() >= 0.6:
+                    blend_proba = _apply_soft_group_consensus(
+                        probabilities=blend_proba,
+                        group_values=test_df[col],
+                        logs=logs,
+                        log_prefix=f"soft_group_consensus_{col}",
+                    )
+                    break
+
+    return (blend_proba >= 0.5).astype(int)
+
+
+def format_predictions(
+    preds: np.ndarray,
+    y_raw: pd.Series,
+    sample_df: pd.DataFrame,
+    pred_col: str,
+    task_meta: dict[str, Any],
+) -> pd.Series:
+    preds_series = pd.Series(preds)
+    sample_vals = sample_df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
+
+    if task_meta["task_type"] == "regression":
+        return preds_series
+
+    if set(sample_vals).issubset({"true", "false"}):
+        return preds_series.astype(int).map({1: "True", 0: "False"}).fillna("False")
+
+    if set(sample_vals).issubset({"0", "1"}):
+        return preds_series.astype(int)
+
+    inverse_mapping = task_meta.get("inverse_mapping")
+    if inverse_mapping is not None:
+        return preds_series.map(inverse_mapping)
+
+    unique_raw = set(y_raw.dropna().astype(str).str.strip().str.lower().unique().tolist())
+    if unique_raw.issubset({"true", "false"}):
+        return preds_series.astype(int).map({1: "True", 0: "False"}).fillna("False")
+
+    return preds_series
+
+
+def sanitize_submission(submission: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+    fixed = sample_df.copy()
+    pred_col = fixed.columns[1]
+    fixed = fixed.astype({pred_col: "object"})
+
+    sample_vals = (
+        sample_df.iloc[:, 1]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .unique()
+        .tolist()
+    )
+
+    if submission.shape[1] >= 2:
+        n = min(len(submission), len(fixed))
+        fixed.iloc[:n, 0] = submission.iloc[:n, 0].values
+        fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
+
+    if set(sample_vals).issubset({"true", "false"}):
+        fixed[pred_col] = (
+            fixed[pred_col]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"1": "True", "0": "False", "true": "True", "false": "False"})
+            .fillna("False")
+        )
+    elif set(sample_vals).issubset({"0", "1"}):
+        fixed[pred_col] = (
+            fixed[pred_col]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .map({"1": 1, "0": 0, "true": 1, "false": 0})
+            .fillna(0)
+            .astype(int)
+        )
+
+    return fixed
+
+
+def solve_competition(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    sample_df: pd.DataFrame,
+    task: dict[str, Any],
+    logs: list[str],
+) -> tuple[pd.DataFrame, str]:
+    target_col = task["target_col"]
+    id_col = task["id_col"]
+    pred_col = task["pred_col"]
+    task_type = task["task_type"]
+
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+
+    y_raw = train_df[target_col].copy()
+    X_train_raw = train_df.drop(columns=[target_col], errors="ignore")
+    X_test_raw = test_df.copy()
+
+    if id_col in X_train_raw.columns:
+        X_train_raw = X_train_raw.drop(columns=[id_col], errors="ignore")
+    if id_col in X_test_raw.columns:
+        X_test_raw = X_test_raw.drop(columns=[id_col], errors="ignore")
+
+    X_train = make_features(X_train_raw, train_df)
+    X_test = make_features(X_test_raw, test_df)
+    X_test = align_columns(X_train, X_test)
+
+    y, task_meta = prepare_target(y_raw, task_type)
+    effective_task_type = task_meta["task_type"]
+
+    candidates = build_candidates(X_train, effective_task_type)
+    ranked = evaluate_candidates(X_train, y, candidates, effective_task_type, logs=logs)
+    best = ranked[0]
+
+    if effective_task_type == "binary_classification":
+        preds = _predict_binary_with_blend(
+            ranked_results=ranked,
+            X_train=X_train,
+            y=y,
+            X_test=X_test,
+            test_df=test_df,
+            logs=logs,
+        )
+    else:
+        final_model = clone(best.model)
+        final_model.fit(X_train, y)
+        preds = final_model.predict(X_test)
+
+    formatted_preds = format_predictions(
+        preds=preds,
+        y_raw=y_raw,
+        sample_df=sample_df,
+        pred_col=pred_col,
+        task_meta=task_meta,
+    )
+
+    submission = pd.DataFrame(
+        {
+            sample_df.columns[0]: test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values,
+            sample_df.columns[1]: pd.Series(formatted_preds, dtype="object"),
+        }
+    )
+    submission = sanitize_submission(submission, sample_df)
+
+    summary = "\n".join(
+        [
+            f"target_col={target_col}",
+            f"id_col={id_col}",
+            f"pred_col={pred_col}",
+            f"task_type={effective_task_type}",
+            f"train_shape={train_df.shape}",
+            f"test_shape={test_df.shape}",
+            f"best_model={best.name}",
+            f"best_cv={best.score:.6f}",
+            "",
+            "candidate_results:",
+            *logs,
+        ]
+    )
+    return submission, summary
+
+
 class Agent:
-    def __init__(self, *, ml_agent_cls: type["MLAgent"] | None = None):
+    def __init__(self) -> None:
         self._done_context: set[str] = set()
-        self._ml_agent_cls = ml_agent_cls or MLAgent
         self.logs: list[str] = []
-
-        # нужны для совместимости с тестами и для _solve_competition
         self._current_work_dir: Path | None = None
         self._current_text: str = ""
         self._current_updater: TaskUpdater | None = None
 
-    def _build_fallback_submission(
-        self,
-        test_df: pd.DataFrame,
-        sample_df: pd.DataFrame,
-    ) -> pd.DataFrame:
+    def _build_fallback_submission(self, test_df: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
         fallback = sample_df.copy()
         id_col = sample_df.columns[0]
 
@@ -1491,23 +956,32 @@ class Agent:
             n = min(len(fallback), len(test_df))
             fallback.iloc[:n, 0] = test_df.iloc[:n][id_col].values
 
-        return fallback
+        return sanitize_submission(fallback, sample_df)
 
-    def _validate_submission(
-        self,
-        submission_df: pd.DataFrame,
-        sample_df: pd.DataFrame,
-    ) -> None:
+    def _validate_submission(self, submission_df: pd.DataFrame, sample_df: pd.DataFrame) -> None:
         if list(submission_df.columns) != list(sample_df.columns):
-            raise ValueError(
-                f"Expected columns {list(sample_df.columns)}, got {list(submission_df.columns)}"
-            )
+            raise ValueError(f"Expected columns {list(sample_df.columns)}, got {list(submission_df.columns)}")
         if len(submission_df) != len(sample_df):
-            raise ValueError(
-                f"Expected {len(sample_df)} rows, got {len(submission_df)}"
-            )
+            raise ValueError(f"Expected {len(sample_df)} rows, got {len(submission_df)}")
         if submission_df.isnull().any().any():
             raise ValueError("Submission contains NaN values")
+
+    def _solve_competition(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+        description: str,
+        task: dict[str, object],
+    ) -> tuple[pd.DataFrame, str]:
+        _ = description
+        return solve_competition(
+            train_df=train_df,
+            test_df=test_df,
+            sample_df=sample_df,
+            task=task,
+            logs=self.logs,
+        )
 
     async def _add_submission_artifact(
         self,
@@ -1536,46 +1010,9 @@ class Agent:
             last_chunk=True,
         )
 
-    def _solve_competition(
-        self,
-        train_df: pd.DataFrame,
-        test_df: pd.DataFrame,
-        sample_df: pd.DataFrame,
-        description: str,
-        task: dict[str, object],
-    ) -> tuple[pd.DataFrame, str]:
-        _ = (train_df, test_df, sample_df, description, task)
-
-        if self._current_work_dir is None:
-            raise RuntimeError("Current workdir is not set")
-
-        api_key = _get_llm_api_key()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY or OPENROUTER_API_KEY is required")
-
-        ml_agent = self._ml_agent_cls(
-            workdir=self._current_work_dir,
-            api_key=api_key,
-            model=OPENAI_MODEL,
-            max_iterations=MAX_ITERATIONS,
-            code_timeout=CODE_TIMEOUT,
-            updater=self._current_updater,
-        )
-
-        submission_path = ml_agent.run(self._current_text, None)
-        if submission_path is None:
-            raise FileNotFoundError("Agent did not produce submission.csv")
-
-        submission_path = _patch_submission_columns(self._current_work_dir, submission_path)
-        submission_path = normalize_submission(self._current_work_dir, submission_path)
-
-        submission_df = pd.read_csv(submission_path)
-        summary = _submission_debug_summary(submission_path)
-        return submission_df, summary
-
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         ctx = message.context_id or "default"
-        text = get_message_text(message)
+        self._current_text = get_message_text(message)
 
         if ctx in self._done_context:
             logger.info("Context %s already finished; ack", ctx)
@@ -1583,7 +1020,7 @@ class Agent:
 
         tar_b64 = _first_tar_from_message(message)
         if not tar_b64:
-            logger.error("No competition tar.gz in message; text len=%s", len(text))
+            logger.error("No competition tar.gz in message")
             await updater.add_artifact(
                 parts=[Part(root=TextPart(text="Error: expected FilePart competition.tar.gz"))],
                 name="Error",
@@ -1597,6 +1034,8 @@ class Agent:
 
         with tempfile.TemporaryDirectory(prefix=f"mle-bench-{ctx}-") as temp_dir:
             work_dir = Path(temp_dir)
+            self._current_work_dir = work_dir
+            self._current_updater = updater
 
             try:
                 _extract_tar_b64(tar_b64, work_dir)
@@ -1611,13 +1050,10 @@ class Agent:
             data_dir = _find_data_dir(work_dir)
 
             description = ""
-            for candidate in ("description.md", "description.txt", "README.md"):
-                description_path = _find_first(data_dir, candidate)
-                if description_path and description_path.exists():
-                    description = description_path.read_text(
-                        encoding="utf-8",
-                        errors="replace",
-                    )[:20000]
+            for candidate in ["description.md", "description.txt", "README.md"]:
+                p = _find_first(data_dir, candidate)
+                if p and p.exists():
+                    description = p.read_text(encoding="utf-8", errors="replace")[:20000]
                     break
 
             train_path = _find_first(data_dir, "train.csv")
@@ -1631,28 +1067,34 @@ class Agent:
                 )
                 return
 
-            train_df = pd.read_csv(train_path)
-            test_df = pd.read_csv(test_path)
-            sample_df = pd.read_csv(sample_path)
+            train_df = _read_csv_any(train_path)
+            test_df = _read_csv_any(test_path)
+            sample_df = _read_csv_any(sample_path)
+
+            if train_df is None or test_df is None or sample_df is None:
+                await updater.add_artifact(
+                    parts=[Part(root=TextPart(text="Error: failed to read train/test/sample_submission files"))],
+                    name="Error",
+                )
+                return
 
             self.logs.append(
                 json.dumps(
                     {
+                        "paths": {
+                            "train": str(train_path),
+                            "test": str(test_path),
+                            "sample_submission": str(sample_path),
+                        },
                         "train_shape": list(train_df.shape),
                         "test_shape": list(test_df.shape),
                         "sample_shape": list(sample_df.shape),
-                        "train_path": str(train_path),
-                        "test_path": str(test_path),
-                        "sample_path": str(sample_path),
                     },
                     ensure_ascii=False,
                 )
             )
 
-            baseline_submission_df = self._build_fallback_submission(
-                test_df=test_df,
-                sample_df=sample_df,
-            )
+            baseline_submission_df = self._build_fallback_submission(test_df=test_df, sample_df=sample_df)
             self._validate_submission(baseline_submission_df, sample_df)
 
             await updater.update_status(
@@ -1665,23 +1107,13 @@ class Agent:
                 artifact_id="submission",
             )
 
-            task = {
-                "target_col": None,
-                "id_col": sample_df.columns[0],
-                "pred_col": sample_df.columns[1] if len(sample_df.columns) > 1 else sample_df.columns[0],
-                "task_type": None,
-            }
-
-            self._current_work_dir = work_dir
-            self._current_text = text
-            self._current_updater = updater
-
             try:
+                task = infer_task(train_df, test_df, sample_df)
+                self.logs.append(json.dumps(task, ensure_ascii=False))
+
                 await updater.update_status(
                     TaskState.working,
-                    new_agent_text_message(
-                        f"Running universal ML agent with model {OPENAI_MODEL}..."
-                    ),
+                    new_agent_text_message("Building features and evaluating candidate models..."),
                 )
 
                 submission_df, summary = self._solve_competition(
@@ -1706,7 +1138,7 @@ class Agent:
                 )
 
             except Exception as exc:
-                logger.exception("ML agent failed")
+                logger.exception("Modeling failed")
                 self.logs.append(f"fallback_used: {exc}")
                 await updater.update_status(
                     TaskState.working,
@@ -1716,8 +1148,8 @@ class Agent:
                 )
             finally:
                 self._current_work_dir = None
-                self._current_text = ""
                 self._current_updater = None
+                self._current_text = ""
 
         self._done_context.add(ctx)
         logger.info("Finished context %s", ctx)
