@@ -112,10 +112,6 @@ class Agent:
 
             await self._add_submission_artifact(updater, submission_df)
 
-            await updater.update_status(
-                TaskState.completed,
-                new_agent_text_message("submission.csv uploaded."),
-            )
 
     def _extract_competition_bundle(self, message: Message, workdir: Path) -> Path:
         bundle_bytes = None
