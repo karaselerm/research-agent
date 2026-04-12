@@ -1,24 +1,33 @@
 import base64
 import io
 import json
-import re
+import tarfile
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+    VotingClassifier,
+)
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import make_scorer, mean_squared_error
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import (
-    DataPart,
     FilePart,
     FileWithBytes,
     Message,
@@ -38,304 +47,406 @@ class CandidateResult:
 
 class Agent:
     def __init__(self):
-        self.lesson_log: list[str] = []
+        self.logs: list[str] = []
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
-        payload = self._collect_payload(message)
-
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Parsing competition payload...")
+            new_agent_text_message("Reading competition bundle..."),
         )
 
-        datasets = self._extract_named_csvs(payload)
-        train_df = datasets.get("train")
-        test_df = datasets.get("test")
-        sample_submission_df = datasets.get("sample_submission")
+        with tempfile.TemporaryDirectory(prefix="purple-agent-") as tmpdir:
+            workdir = Path(tmpdir)
+            data_dir = self._extract_competition_bundle(message, workdir)
 
-        await updater.add_artifact(
-            parts=[Part(root=TextPart(text=payload[:30000]))],
-            name="debug_input_preview.txt",
-        )
+            description = self._read_description(data_dir)
+            train_df, test_df, sample_df, paths_info = self._load_core_files(data_dir)
 
-        if sample_submission_df is None:
-            raise ValueError("Could not find sample_submission.csv in the incoming payload.")
-
-        if train_df is None or test_df is None:
-            fallback = self._fill_sample_submission(sample_submission_df)
-            await self._add_csv_artifact(updater, "submission.csv", fallback)
             await updater.add_artifact(
-                parts=[Part(root=TextPart(text="Used fallback sample_submission because train/test were not found."))],
-                name="debug_strategy.txt",
+                parts=[
+                    Part(
+                        root=TextPart(
+                            text=json.dumps(
+                                {
+                                    "data_dir": str(data_dir),
+                                    "paths": paths_info,
+                                    "train_shape": list(train_df.shape),
+                                    "test_shape": list(test_df.shape),
+                                    "sample_shape": list(sample_df.shape),
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        )
+                    )
+                ],
+                name="debug_dataset_detection.txt",
             )
-            return
 
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message("Analyzing schema and preparing candidate models...")
+            task = self._infer_task(train_df, test_df, sample_df)
+            self.logs.append(json.dumps(task, ensure_ascii=False))
+
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message("Building features and evaluating candidate models..."),
+            )
+
+            submission_df, summary = self._solve_competition(
+                train_df=train_df,
+                test_df=test_df,
+                sample_df=sample_df,
+                description=description,
+                task=task,
+            )
+
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=summary))],
+                name="debug_report.txt",
+            )
+
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
+                name="debug_submission_preview.csv",
+            )
+
+            await self._add_submission_artifact(updater, submission_df)
+
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message("submission.csv uploaded."),
+            )
+
+    def _extract_competition_bundle(self, message: Message, workdir: Path) -> Path:
+        bundle_bytes = None
+
+        for part in message.parts:
+            root = part.root
+            if isinstance(root, FilePart):
+                file_obj = root.file
+                if isinstance(file_obj, FileWithBytes) and file_obj.bytes is not None:
+                    raw = file_obj.bytes
+                    if isinstance(raw, str):
+                        try:
+                            bundle_bytes = base64.b64decode(raw)
+                            break
+                        except Exception:
+                            continue
+                    elif isinstance(raw, (bytes, bytearray)):
+                        bundle_bytes = bytes(raw)
+                        break
+
+        if bundle_bytes is None:
+            raise ValueError("No competition tar.gz found in message.")
+
+        extract_root = workdir / "bundle"
+        extract_root.mkdir(parents=True, exist_ok=True)
+
+        mode = "r:gz" if bundle_bytes[:2] == b"\x1f\x8b" else "r:"
+        with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode=mode) as tar:
+            tar.extractall(extract_root)
+
+        candidates = [
+            extract_root / "home" / "data",
+            extract_root / "data",
+            extract_root,
+        ]
+        for path in candidates:
+            if path.exists():
+                csvs = list(path.rglob("*.csv"))
+                if csvs:
+                    return path
+
+        return extract_root
+
+    def _read_description(self, data_dir: Path) -> str:
+        for name in ["description.md", "description.txt", "README.md"]:
+            p = data_dir / name
+            if p.exists():
+                return p.read_text(encoding="utf-8", errors="replace")[:20000]
+        return ""
+
+    def _load_core_files(
+        self, data_dir: Path
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, str]]:
+        csv_paths = list(data_dir.rglob("*.csv"))
+        if not csv_paths:
+            raise ValueError("No CSV files found in extracted bundle.")
+
+        train_path = None
+        test_path = None
+        sample_path = None
+
+        for p in csv_paths:
+            s = str(p).lower()
+            if "sample_submission" in s:
+                sample_path = p
+            elif s.endswith("train.csv") or "/train.csv" in s or "\\train.csv" in s:
+                train_path = p
+            elif s.endswith("test.csv") or "/test.csv" in s or "\\test.csv" in s:
+                test_path = p
+
+        if train_path is None:
+            for p in csv_paths:
+                s = str(p).lower()
+                if "train" in s and "sample" not in s:
+                    train_path = p
+                    break
+
+        if test_path is None:
+            for p in csv_paths:
+                s = str(p).lower()
+                if "test" in s and "sample" not in s:
+                    test_path = p
+                    break
+
+        if sample_path is None:
+            for p in csv_paths:
+                df = self._read_csv_any(p)
+                if df is not None and df.shape[1] == 2:
+                    first, second = df.columns[0], df.columns[1]
+                    if first.lower().endswith("id") or second.lower() in {
+                        "target",
+                        "transported",
+                        "survived",
+                        "label",
+                    }:
+                        sample_path = p
+                        break
+
+        if train_path is None or test_path is None or sample_path is None:
+            raise ValueError(
+                f"Could not identify train/test/sample files. "
+                f"train={train_path}, test={test_path}, sample={sample_path}"
+            )
+
+        train_df = self._read_csv_any(train_path)
+        test_df = self._read_csv_any(test_path)
+        sample_df = self._read_csv_any(sample_path)
+
+        if train_df is None or test_df is None or sample_df is None:
+            raise ValueError("Failed to read one or more CSV files.")
+
+        return (
+            train_df,
+            test_df,
+            sample_df,
+            {
+                "train": str(train_path),
+                "test": str(test_path),
+                "sample_submission": str(sample_path),
+            },
         )
 
-        target_col = self._detect_target_column(train_df, sample_submission_df)
-        id_col = self._detect_id_column(test_df, sample_submission_df)
-        pred_col = self._detect_submission_prediction_column(sample_submission_df, target_col)
+    def _read_csv_any(self, path: Path) -> pd.DataFrame | None:
+        for enc in ["utf-8", "utf-8-sig", "latin1"]:
+            try:
+                return pd.read_csv(path, encoding=enc)
+            except Exception:
+                continue
+        return None
 
-        if target_col is None:
-            fallback = self._fill_sample_submission(sample_submission_df)
-            await self._add_csv_artifact(updater, "submission.csv", fallback)
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text="Target column not detected; used fallback sample_submission."))],
-                name="debug_strategy.txt",
-            )
-            return
+    def _infer_task(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+    ) -> dict[str, Any]:
+        pred_col = sample_df.columns[1]
+        id_col = sample_df.columns[0]
+
+        if pred_col in train_df.columns:
+            target_col = pred_col
+        else:
+            candidate_cols = [c for c in train_df.columns if c not in test_df.columns]
+            if len(candidate_cols) == 1:
+                target_col = candidate_cols[0]
+            else:
+                target_col = None
+                for c in ["target", "label", "Transported", "Survived", "Response", "Outcome"]:
+                    if c in train_df.columns:
+                        target_col = c
+                        break
+                if target_col is None:
+                    raise ValueError("Could not detect target column.")
+
+        y = train_df[target_col]
+        pred_values = sample_df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
+
+        is_bool_sample = set(pred_values).issubset({"true", "false"})
+        is_int_sample = set(pred_values).issubset({"0", "1"})
+
+        if is_bool_sample or is_int_sample:
+            task_type = "binary_classification"
+        else:
+            nunique = y.nunique(dropna=True)
+            if pd.api.types.is_numeric_dtype(y) and nunique > 20:
+                task_type = "regression"
+            elif nunique <= 20:
+                task_type = "classification"
+            else:
+                task_type = "regression"
+
+        return {
+            "target_col": target_col,
+            "id_col": id_col,
+            "pred_col": pred_col,
+            "task_type": task_type,
+            "is_bool_sample": is_bool_sample,
+            "is_int_sample": is_int_sample,
+        }
+
+    def _solve_competition(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+        description: str,
+        task: dict[str, Any],
+    ) -> tuple[pd.DataFrame, str]:
+        target_col = task["target_col"]
+        id_col = task["id_col"]
+        pred_col = task["pred_col"]
+        task_type = task["task_type"]
 
         train_df = train_df.copy()
         test_df = test_df.copy()
 
         y_raw = train_df[target_col].copy()
-        X_train = train_df.drop(columns=[target_col], errors="ignore")
-        X_test = test_df.copy()
+        X_train_raw = train_df.drop(columns=[target_col], errors="ignore")
+        X_test_raw = test_df.copy()
 
-        if id_col and id_col in X_train.columns:
-            X_train = X_train.drop(columns=[id_col], errors="ignore")
-        if id_col and id_col in X_test.columns:
-            X_test_features = X_test.drop(columns=[id_col], errors="ignore")
+        if id_col in X_train_raw.columns:
+            X_train_raw = X_train_raw.drop(columns=[id_col], errors="ignore")
+        if id_col in X_test_raw.columns:
+            X_test_raw = X_test_raw.drop(columns=[id_col], errors="ignore")
+
+        X_train = self._make_features(X_train_raw, train_df, description)
+        X_test = self._make_features(X_test_raw, test_df, description)
+        X_test = self._align_columns(X_train, X_test)
+
+        y, task_meta = self._prepare_target(y_raw, task_type)
+        effective_task_type = task_meta["task_type"]
+
+        candidates = self._build_candidates(X_train, y, effective_task_type)
+        best = self._evaluate_candidates(X_train, y, candidates, effective_task_type)
+
+        final_model = best.model
+        final_model.fit(X_train, y)
+
+        if effective_task_type in {"binary_classification", "classification"}:
+            preds = final_model.predict(X_test)
         else:
-            X_test_features = X_test.copy()
+            preds = final_model.predict(X_test)
 
-        X_train = self._feature_engineer(X_train, train_df)
-        X_test_features = self._feature_engineer(X_test_features, test_df)
-        X_test_features = self._align_test_to_train(X_train, X_test_features)
-
-        y, target_format = self._coerce_target(y_raw)
-
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message("Evaluating candidate pipelines with cross-validation...")
-        )
-
-        best = self._select_best_candidate(X_train, y)
-
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message(f"Best candidate: {best.name} (CV={best.score:.4f}). Training final model...")
-        )
-
-        best.model.fit(X_train, y)
-        preds = best.model.predict(X_test_features)
-
-        submission = self._build_submission(
-            test_df=test_df,
-            sample_submission_df=sample_submission_df,
-            id_col=id_col,
-            pred_col=pred_col,
+        submission = sample_df.copy()
+        submission.iloc[:, 0] = test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values
+        submission.iloc[:, 1] = self._format_predictions(
             preds=preds,
-            target_format=target_format,
+            y_raw=y_raw,
+            sample_df=sample_df,
+            pred_col=pred_col,
+            task_meta=task_meta,
         )
 
-        submission = self._sanitize_submission_against_sample(
-            submission=submission,
-            sample_submission_df=sample_submission_df,
+        submission = self._sanitize_submission(submission, sample_df)
+
+        summary = "\n".join(
+            [
+                f"target_col={target_col}",
+                f"id_col={id_col}",
+                f"pred_col={pred_col}",
+                f"task_type={effective_task_type}",
+                f"train_shape={train_df.shape}",
+                f"test_shape={test_df.shape}",
+                f"best_model={best.name}",
+                f"best_cv={best.score:.6f}",
+                "",
+                "candidate_results:",
+                *self.logs,
+            ]
         )
+        return submission, summary
 
-        debug_report = [
-            f"target_col={target_col}",
-            f"id_col={id_col}",
-            f"pred_col={pred_col}",
-            f"target_format={target_format}",
-            f"train_shape={train_df.shape}",
-            f"test_shape={test_df.shape}",
-            f"submission_shape={submission.shape}",
-            f"best_model={best.name}",
-            f"best_cv={best.score:.6f}",
-            "",
-            "candidate_logs:",
-            *self.lesson_log,
-        ]
-
-        await updater.add_artifact(
-            parts=[Part(root=TextPart(text="\n".join(debug_report)))],
-            name="debug_report.txt",
-        )
-
-        await updater.add_artifact(
-            parts=[Part(root=TextPart(text=submission.head(20).to_csv(index=False)))],
-            name="debug_submission_preview.csv",
-        )
-
-        await self._add_csv_artifact(updater, "submission.csv", submission)
-
-    async def _add_csv_artifact(self, updater: TaskUpdater, filename: str, df: pd.DataFrame) -> None:
-        csv_text = df.to_csv(index=False)
-        encoded = base64.b64encode(csv_text.encode("utf-8")).decode("ascii")
-
-        await updater.add_artifact(
-            parts=[
-                Part(
-                    root=FilePart(
-                        file=FileWithBytes(
-                            name=filename,
-                            mimeType="text/csv",
-                            bytes=encoded,
-                        )
-                    )
-                )
-            ],
-            name=filename,
-            append=False,
-            last_chunk=True,
-        )
-
-    def _collect_payload(self, message: Message) -> str:
-        chunks: list[str] = []
-        for part in message.parts:
-            root = part.root
-            if isinstance(root, TextPart):
-                if root.text:
-                    chunks.append(root.text)
-            elif isinstance(root, DataPart):
-                try:
-                    chunks.append(json.dumps(root.data, ensure_ascii=False, indent=2))
-                except Exception:
-                    chunks.append(str(root.data))
-            else:
-                chunks.append(str(root))
-        return "\n\n".join(chunks)
-
-    def _extract_named_csvs(self, text: str) -> dict[str, pd.DataFrame]:
-        out: dict[str, pd.DataFrame] = {}
-        for name in ["train", "test", "sample_submission"]:
-            df = self._find_csv_after_filename(text, name)
-            if df is not None:
-                out[name] = df
-
-        if "sample_submission" not in out:
-            sample_df = self._find_generic_sample_submission(text)
-            if sample_df is not None:
-                out["sample_submission"] = sample_df
-
-        return out
-
-    def _find_csv_after_filename(self, text: str, base_name: str) -> pd.DataFrame | None:
-        patterns = [
-            rf"{re.escape(base_name)}\.csv.*?```(?:csv)?\n(.*?)```",
-            rf"{re.escape(base_name)}\.csv.*?\n((?:[^\n]*,[^\n]*\n)+)",
-        ]
-        for pattern in patterns:
-            matches = re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            for block in matches:
-                df = self._safe_read_csv(block)
-                if df is not None and not df.empty:
-                    return df
-        return None
-
-    def _find_generic_sample_submission(self, text: str) -> pd.DataFrame | None:
-        patterns = [
-            r"```(?:csv)?\n(PassengerId\s*,\s*Transported.*?)(?:```)",
-            r"```(?:csv)?\n(id\s*,\s*target.*?)(?:```)",
-        ]
-        for pattern in patterns:
-            matches = re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            for block in matches:
-                df = self._safe_read_csv(block)
-                if df is not None and not df.empty:
-                    return df
-        return None
-
-    def _safe_read_csv(self, raw_csv: str) -> pd.DataFrame | None:
-        cleaned = self._trim_csv_like_text(raw_csv)
-        if not cleaned:
-            return None
-        try:
-            return pd.read_csv(io.StringIO(cleaned))
-        except Exception:
-            return None
-
-    def _trim_csv_like_text(self, text: str) -> str:
-        lines = [line.rstrip() for line in text.splitlines() if line.strip()]
-        csv_lines = [line for line in lines if "," in line]
-        return "\n".join(csv_lines)
-
-    def _detect_target_column(self, train_df: pd.DataFrame, sample_submission_df: pd.DataFrame | None) -> str | None:
-        preferred = ["Transported", "target", "label", "Survived", "Outcome", "Response"]
-        for col in preferred:
-            if col in train_df.columns:
-                return col
-
-        if sample_submission_df is not None and len(sample_submission_df.columns) >= 2:
-            cand = sample_submission_df.columns[1]
-            if cand in train_df.columns:
-                return cand
-
-        for col in reversed(train_df.columns):
-            if "id" in col.lower():
-                continue
-            nunique = train_df[col].nunique(dropna=True)
-            if 2 <= nunique <= 20:
-                return col
-
-        return None
-
-    def _detect_id_column(self, test_df: pd.DataFrame, sample_submission_df: pd.DataFrame) -> str:
-        preferred = ["PassengerId", "id", "Id", "ID", "row_id"]
-        for col in preferred:
-            if col in test_df.columns:
-                return col
-
-        first = sample_submission_df.columns[0]
-        if first in test_df.columns:
-            return first
-
-        return first
-
-    def _detect_submission_prediction_column(self, sample_submission_df: pd.DataFrame, target_col: str) -> str:
-        if len(sample_submission_df.columns) >= 2:
-            return sample_submission_df.columns[1]
-        return target_col
-
-    def _feature_engineer(self, X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    def _make_features(
+        self,
+        X: pd.DataFrame,
+        raw_df: pd.DataFrame,
+        description: str,
+    ) -> pd.DataFrame:
         X = X.copy()
 
-        if "Cabin" in raw_df.columns and "Cabin" in X.columns:
-            cabin_parts = raw_df["Cabin"].astype(str).str.split("/", expand=True)
-            if cabin_parts.shape[1] >= 3:
-                X["CabinDeck"] = cabin_parts[0]
-                X["CabinNum"] = pd.to_numeric(cabin_parts[1], errors="coerce")
-                X["CabinSide"] = cabin_parts[2]
+        # Generic numeric coercion
+        for col in X.columns:
+            if X[col].dtype == object:
+                sample = X[col].dropna().astype(str).head(20)
+                if len(sample) > 0 and sample.str.fullmatch(r"-?\d+(\.\d+)?").mean() > 0.8:
+                    X[col] = pd.to_numeric(X[col], errors="coerce")
 
-        if "Name" in raw_df.columns and "Name" in X.columns:
-            X["NameLength"] = raw_df["Name"].astype(str).str.len()
+        # Spaceship Titanic-style features
+        if "Cabin" in raw_df.columns and "Cabin" in X.columns:
+            cabin = raw_df["Cabin"].astype(str).str.split("/", expand=True)
+            if cabin.shape[1] >= 3:
+                X["CabinDeck"] = cabin[0]
+                X["CabinNum"] = pd.to_numeric(cabin[1], errors="coerce")
+                X["CabinSide"] = cabin[2]
 
         if "PassengerId" in raw_df.columns:
-            pid_parts = raw_df["PassengerId"].astype(str).str.split("_", expand=True)
-            if pid_parts.shape[1] >= 2:
-                X["GroupId"] = pd.to_numeric(pid_parts[0], errors="coerce")
-                X["WithinGroupNo"] = pd.to_numeric(pid_parts[1], errors="coerce")
-                X["PassengerGroupSize"] = raw_df.groupby(pid_parts[0])[pid_parts[0]].transform("count").values
+            pid = raw_df["PassengerId"].astype(str).str.split("_", expand=True)
+            if pid.shape[1] >= 2:
+                group_id = pid[0]
+                X["GroupId"] = pd.to_numeric(group_id, errors="coerce")
+                X["WithinGroupNo"] = pd.to_numeric(pid[1], errors="coerce")
+                X["PassengerGroupSize"] = group_id.map(group_id.value_counts())
 
-        spend_cols = ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"]
-        existing = [c for c in spend_cols if c in raw_df.columns]
-        if existing:
-            for c in existing:
+        if "Name" in raw_df.columns and "Name" in X.columns:
+            name_series = raw_df["Name"].astype(str)
+            X["NameLength"] = name_series.str.len()
+            X["NameWordCount"] = name_series.str.split().str.len()
+
+        spend_cols = [c for c in ["RoomService", "FoodCourt", "ShoppingMall", "Spa", "VRDeck"] if c in raw_df.columns]
+        if spend_cols:
+            for c in spend_cols:
                 X[c] = pd.to_numeric(raw_df[c], errors="coerce")
-            X["TotalSpend"] = X[existing].sum(axis=1)
+            X["TotalSpend"] = X[spend_cols].sum(axis=1)
             X["NoSpend"] = (X["TotalSpend"].fillna(0) == 0).astype(int)
-            luxury = [c for c in ["Spa", "VRDeck"] if c in X.columns]
-            if luxury:
-                X["LuxurySpend"] = X[luxury].sum(axis=1)
+            luxury_cols = [c for c in ["Spa", "VRDeck"] if c in X.columns]
+            if luxury_cols:
+                X["LuxurySpend"] = X[luxury_cols].sum(axis=1)
+            if "CryoSleep" in raw_df.columns:
+                cryo = raw_df["CryoSleep"].astype(str).str.lower()
+                X["CryoNoSpendMatch"] = (
+                    (cryo.isin(["true", "1"])) & (X["NoSpend"] == 1)
+                ).astype(int)
 
         if "Age" in raw_df.columns:
             X["Age"] = pd.to_numeric(raw_df["Age"], errors="coerce")
             X["AgeMissing"] = X["Age"].isna().astype(int)
-            X["AgeBinTeen"] = ((X["Age"] >= 12) & (X["Age"] < 20)).astype(int)
-            X["AgeBinSenior"] = (X["Age"] >= 60).astype(int)
+            X["Age2"] = X["Age"] ** 2
+            X["IsChild"] = (X["Age"] < 18).astype(float)
+            X["IsSenior"] = (X["Age"] >= 60).astype(float)
 
-        for col in ["CryoSleep", "VIP", "HomePlanet", "Destination"]:
+        for col in ["HomePlanet", "Destination", "VIP", "CryoSleep"]:
             if col in raw_df.columns:
                 X[col] = raw_df[col].astype(str)
 
+        # Light generic text features
+        object_cols = [c for c in X.columns if X[c].dtype == object]
+        for col in object_cols[:6]:
+            s = X[col].astype(str)
+            X[f"{col}__len"] = s.str.len()
+            X[f"{col}__missing_like"] = s.isin(["nan", "None", ""]).astype(int)
+
+        # Remove raw high-cardinality identifiers except useful engineered features
+        drop_cols = []
+        for col in X.columns:
+            if col.lower() in {"name", "cabin"}:
+                drop_cols.append(col)
+        if drop_cols:
+            X = X.drop(columns=drop_cols, errors="ignore")
+
         return X
 
-    def _align_test_to_train(self, X_train: pd.DataFrame, X_test: pd.DataFrame) -> pd.DataFrame:
+    def _align_columns(self, X_train: pd.DataFrame, X_test: pd.DataFrame) -> pd.DataFrame:
         X_test = X_test.copy()
         for col in X_train.columns:
             if col not in X_test.columns:
@@ -345,253 +456,463 @@ class Agent:
             X_test = X_test.drop(columns=extra_cols)
         return X_test[X_train.columns]
 
-    def _coerce_target(self, y: pd.Series) -> tuple[pd.Series, str]:
-        if y.dtype == bool:
-            return y.astype(int), "bool"
+    def _prepare_target(self, y_raw: pd.Series, task_type: str) -> tuple[pd.Series, dict[str, Any]]:
+        meta: dict[str, Any] = {"task_type": task_type}
 
-        lowered = y.astype(str).str.lower().str.strip()
-        if set(lowered.dropna().unique()).issubset({"true", "false"}):
-            return lowered.map({"true": 1, "false": 0}).astype(int), "truefalse"
+        if task_type in {"binary_classification", "classification"}:
+            lowered = y_raw.astype(str).str.strip().str.lower()
+            if set(lowered.dropna().unique()).issubset({"true", "false"}):
+                y = lowered.map({"true": 1, "false": 0}).astype(int)
+                meta["original_format"] = "bool_str"
+                meta["class_labels"] = [0, 1]
+                meta["task_type"] = "binary_classification"
+                return y, meta
 
-        if set(y.dropna().unique()).issubset({0, 1}):
-            return y.astype(int), "int01"
+            if pd.api.types.is_bool_dtype(y_raw):
+                y = y_raw.astype(int)
+                meta["original_format"] = "bool"
+                meta["class_labels"] = [0, 1]
+                meta["task_type"] = "binary_classification"
+                return y, meta
 
-        return y, "raw"
+            nunique = y_raw.nunique(dropna=True)
+            if nunique == 2:
+                # stable binary mapping
+                classes = sorted(pd.Series(y_raw.dropna().unique()).tolist(), key=lambda x: str(x))
+                mapping = {classes[0]: 0, classes[1]: 1}
+                y = y_raw.map(mapping).astype(int)
+                meta["original_format"] = "binary_generic"
+                meta["inverse_mapping"] = {0: classes[0], 1: classes[1]}
+                meta["class_labels"] = [0, 1]
+                meta["task_type"] = "binary_classification"
+                return y, meta
 
-    def _build_preprocessor(self, X: pd.DataFrame) -> ColumnTransformer:
-        numeric = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
-        categorical = [c for c in X.columns if c not in numeric]
+            # multiclass
+            classes = sorted(pd.Series(y_raw.dropna().unique()).tolist(), key=lambda x: str(x))
+            mapping = {c: i for i, c in enumerate(classes)}
+            y = y_raw.map(mapping).astype(int)
+            meta["original_format"] = "multiclass"
+            meta["inverse_mapping"] = {i: c for i, c in enumerate(classes)}
+            meta["class_labels"] = list(range(len(classes)))
+            meta["task_type"] = "classification"
+            return y, meta
 
-        return ColumnTransformer(
+        y = pd.to_numeric(y_raw, errors="coerce")
+        if y.isna().any():
+            y = y.fillna(y.median())
+        meta["original_format"] = "regression"
+        meta["task_type"] = "regression"
+        return y, meta
+
+    def _build_candidates(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        task_type: str,
+    ) -> list[tuple[str, Any]]:
+        num_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
+        cat_cols = [c for c in X.columns if c not in num_cols]
+
+        pre_ohe = ColumnTransformer(
             transformers=[
                 (
                     "num",
-                    Pipeline([
-                        ("imputer", SimpleImputer(strategy="median")),
-                        ("scaler", StandardScaler()),
-                    ]),
-                    numeric,
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                            ("scaler", StandardScaler()),
+                        ]
+                    ),
+                    num_cols,
                 ),
                 (
                     "cat",
-                    Pipeline([
-                        ("imputer", SimpleImputer(strategy="most_frequent")),
-                        ("onehot", OneHotEncoder(handle_unknown="ignore")),
-                    ]),
-                    categorical,
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="most_frequent")),
+                            ("ohe", OneHotEncoder(handle_unknown="ignore")),
+                        ]
+                    ),
+                    cat_cols,
                 ),
             ]
         )
 
-    def _candidate_models(self, X: pd.DataFrame) -> list[tuple[str, Pipeline]]:
-        pre = self._build_preprocessor(X)
-
-        return [
-            (
-                "logreg",
-                Pipeline([
-                    ("pre", pre),
-                    ("model", LogisticRegression(max_iter=3000, C=1.0, solver="liblinear", random_state=42)),
-                ]),
-            ),
-            (
-                "rf",
-                Pipeline([
-                    ("pre", pre),
-                    ("model", RandomForestClassifier(
-                        n_estimators=500,
-                        max_depth=12,
-                        min_samples_leaf=2,
-                        random_state=42,
-                        n_jobs=-1,
-                    )),
-                ]),
-            ),
-            (
-                "extratrees",
-                Pipeline([
-                    ("pre", pre),
-                    ("model", ExtraTreesClassifier(
-                        n_estimators=700,
-                        max_depth=None,
-                        min_samples_leaf=1,
-                        random_state=42,
-                        n_jobs=-1,
-                    )),
-                ]),
-            ),
-            (
-                "hgb",
-                Pipeline([
-                    ("pre", pre),
-                    ("model", HistGradientBoostingClassifier(
-                        max_depth=8,
-                        learning_rate=0.05,
-                        max_iter=300,
-                        random_state=42,
-                    )),
-                ]),
-            ),
-        ]
-
-    def _select_best_candidate(self, X: pd.DataFrame, y: pd.Series) -> CandidateResult:
-        cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=42)
-        results: list[CandidateResult] = []
-
-        for name, model in self._candidate_models(X):
-            try:
-                scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=1)
-                score = float(np.mean(scores))
-                results.append(CandidateResult(name=name, score=score, model=model))
-                self.lesson_log.append(f"{name}: CV={score:.4f}")
-            except Exception as e:
-                self.lesson_log.append(f"{name} failed: {e}")
-
-        if not results:
-            raise RuntimeError("All candidate models failed during cross-validation.")
-
-        results.sort(key=lambda r: r.score, reverse=True)
-        return results[0]
-
-    def _build_submission(
-        self,
-        test_df: pd.DataFrame,
-        sample_submission_df: pd.DataFrame,
-        id_col: str,
-        pred_col: str,
-        preds: np.ndarray,
-        target_format: str,
-    ) -> pd.DataFrame:
-        submission = pd.DataFrame()
-
-        sample_id_col = sample_submission_df.columns[0]
-        sample_pred_col = sample_submission_df.columns[1]
-
-        if id_col in test_df.columns:
-            submission[sample_id_col] = test_df[id_col].values
-        else:
-            submission[sample_id_col] = sample_submission_df.iloc[:, 0].values
-
-        submission[sample_pred_col] = self._format_predictions(
-            preds=preds,
-            target_format=target_format,
-            sample_submission_df=sample_submission_df,
-            pred_col=sample_pred_col,
+        pre_ord = ColumnTransformer(
+            transformers=[
+                (
+                    "num",
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="median")),
+                        ]
+                    ),
+                    num_cols,
+                ),
+                (
+                    "cat",
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="most_frequent")),
+                            (
+                                "ord",
+                                OrdinalEncoder(
+                                    handle_unknown="use_encoded_value",
+                                    unknown_value=-1,
+                                ),
+                            ),
+                        ]
+                    ),
+                    cat_cols,
+                ),
+            ]
         )
 
-        return submission
+        candidates: list[tuple[str, Any]] = []
+
+        if task_type == "binary_classification":
+            logreg = Pipeline(
+                [
+                    ("pre", pre_ohe),
+                    ("model", LogisticRegression(max_iter=4000, C=1.5, solver="liblinear", random_state=42)),
+                ]
+            )
+            rf = Pipeline(
+                [
+                    ("pre", pre_ohe),
+                    (
+                        "model",
+                        RandomForestClassifier(
+                            n_estimators=700,
+                            max_depth=16,
+                            min_samples_leaf=2,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                ]
+            )
+            et = Pipeline(
+                [
+                    ("pre", pre_ohe),
+                    (
+                        "model",
+                        ExtraTreesClassifier(
+                            n_estimators=1000,
+                            max_depth=None,
+                            min_samples_leaf=1,
+                            random_state=42,
+                            n_jobs=-1,
+                        ),
+                    ),
+                ]
+            )
+            hgb = Pipeline(
+                [
+                    ("pre", pre_ord),
+                    (
+                        "model",
+                        HistGradientBoostingClassifier(
+                            learning_rate=0.04,
+                            max_depth=8,
+                            max_iter=500,
+                            l2_regularization=0.05,
+                            random_state=42,
+                        ),
+                    ),
+                ]
+            )
+
+            candidates.extend(
+                [
+                    ("logreg_ohe", logreg),
+                    ("rf_ohe", rf),
+                    ("extratrees_ohe", et),
+                    ("hgb_ordinal", hgb),
+                ]
+            )
+
+        elif task_type == "classification":
+            candidates.extend(
+                [
+                    (
+                        "rf_ohe",
+                        Pipeline(
+                            [
+                                ("pre", pre_ohe),
+                                (
+                                    "model",
+                                    RandomForestClassifier(
+                                        n_estimators=700,
+                                        max_depth=16,
+                                        min_samples_leaf=2,
+                                        random_state=42,
+                                        n_jobs=-1,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                    (
+                        "extratrees_ohe",
+                        Pipeline(
+                            [
+                                ("pre", pre_ohe),
+                                (
+                                    "model",
+                                    ExtraTreesClassifier(
+                                        n_estimators=1000,
+                                        max_depth=None,
+                                        min_samples_leaf=1,
+                                        random_state=42,
+                                        n_jobs=-1,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                    (
+                        "hgb_ordinal",
+                        Pipeline(
+                            [
+                                ("pre", pre_ord),
+                                (
+                                    "model",
+                                    HistGradientBoostingClassifier(
+                                        learning_rate=0.04,
+                                        max_depth=8,
+                                        max_iter=500,
+                                        l2_regularization=0.05,
+                                        random_state=42,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                ]
+            )
+
+        else:
+            candidates.extend(
+                [
+                    (
+                        "ridge_ohe",
+                        Pipeline(
+                            [
+                                ("pre", pre_ohe),
+                                ("model", Ridge(alpha=1.0, random_state=42)),
+                            ]
+                        ),
+                    ),
+                    (
+                        "rf_reg_ohe",
+                        Pipeline(
+                            [
+                                ("pre", pre_ohe),
+                                (
+                                    "model",
+                                    RandomForestRegressor(
+                                        n_estimators=700,
+                                        max_depth=16,
+                                        min_samples_leaf=2,
+                                        random_state=42,
+                                        n_jobs=-1,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                    (
+                        "extratrees_reg_ohe",
+                        Pipeline(
+                            [
+                                ("pre", pre_ohe),
+                                (
+                                    "model",
+                                    ExtraTreesRegressor(
+                                        n_estimators=1000,
+                                        max_depth=None,
+                                        min_samples_leaf=1,
+                                        random_state=42,
+                                        n_jobs=-1,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                    (
+                        "hgb_reg_ordinal",
+                        Pipeline(
+                            [
+                                ("pre", pre_ord),
+                                (
+                                    "model",
+                                    HistGradientBoostingRegressor(
+                                        learning_rate=0.04,
+                                        max_depth=8,
+                                        max_iter=500,
+                                        l2_regularization=0.05,
+                                        random_state=42,
+                                    ),
+                                ),
+                            ]
+                        ),
+                    ),
+                ]
+            )
+
+        return candidates
+
+    def _evaluate_candidates(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        candidates: list[tuple[str, Any]],
+        task_type: str,
+    ) -> CandidateResult:
+        results: list[CandidateResult] = []
+
+        if task_type in {"binary_classification", "classification"}:
+            n_splits = 5 if len(y) >= 500 else 4
+            cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+            scoring = "accuracy"
+        else:
+            n_splits = 5 if len(y) >= 500 else 4
+            cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+            scoring = make_scorer(
+                lambda yt, yp: -float(np.sqrt(mean_squared_error(yt, yp))),
+                greater_is_better=True,
+            )
+
+        for name, model in candidates:
+            try:
+                scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
+                score = float(np.mean(scores))
+                results.append(CandidateResult(name=name, score=score, model=model))
+                self.logs.append(f"{name}: {score:.6f}")
+            except Exception as e:
+                self.logs.append(f"{name}: FAILED ({e})")
+
+        if not results:
+            raise RuntimeError("All candidate models failed.")
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        best = results[0]
+
+        # Extra strong step for binary classification: build a soft-voting ensemble of top 3
+        if task_type == "binary_classification":
+            top = results[:3]
+            ensemble_estimators = []
+            for i, r in enumerate(top):
+                model = r.model
+                if hasattr(model, "predict_proba"):
+                    ensemble_estimators.append((f"m{i}", model))
+
+            if len(ensemble_estimators) >= 2:
+                try:
+                    ensemble = VotingClassifier(
+                        estimators=ensemble_estimators,
+                        voting="soft",
+                        n_jobs=1,
+                    )
+                    cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+                    ens_score = float(np.mean(cross_val_score(ensemble, X, y, cv=cv, scoring="accuracy", n_jobs=1)))
+                    self.logs.append(f"soft_voting_top_models: {ens_score:.6f}")
+                    if ens_score > best.score:
+                        best = CandidateResult(
+                            name="soft_voting_top_models",
+                            score=ens_score,
+                            model=ensemble,
+                        )
+                except Exception as e:
+                    self.logs.append(f"soft_voting_top_models: FAILED ({e})")
+
+        return best
 
     def _format_predictions(
         self,
         preds: np.ndarray,
-        target_format: str,
-        sample_submission_df: pd.DataFrame,
+        y_raw: pd.Series,
+        sample_df: pd.DataFrame,
         pred_col: str,
+        task_meta: dict[str, Any],
     ) -> pd.Series:
-        preds = pd.Series(preds)
+        preds_series = pd.Series(preds)
+        sample_vals = sample_df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
 
-        sample_vals = (
-            sample_submission_df[pred_col]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .unique()
-            .tolist()
-        )
+        if task_meta["task_type"] == "regression":
+            return preds_series
 
-        if target_format in {"bool", "truefalse"} or set(sample_vals).issubset({"true", "false"}):
-            return preds.astype(int).map({1: "True", 0: "False"})
+        if set(sample_vals).issubset({"true", "false"}):
+            return preds_series.astype(int).map({1: "True", 0: "False"}).fillna("False")
 
-        if target_format == "int01" or set(sample_vals).issubset({"0", "1"}):
-            return preds.astype(int)
+        if set(sample_vals).issubset({"0", "1"}):
+            return preds_series.astype(int)
 
-        return preds
+        original_format = task_meta.get("original_format")
+        inverse_mapping = task_meta.get("inverse_mapping")
 
-    def _sanitize_submission_against_sample(
-        self,
-        submission: pd.DataFrame,
-        sample_submission_df: pd.DataFrame,
-    ) -> pd.DataFrame:
-        sample_cols = list(sample_submission_df.columns)
-        submission = submission.copy()
+        if inverse_mapping is not None:
+            return preds_series.map(inverse_mapping)
 
-        if len(sample_cols) < 2:
-            raise ValueError("sample_submission.csv has invalid format.")
+        if original_format in {"bool", "bool_str", "binary_generic"}:
+            unique_raw = set(y_raw.dropna().astype(str).str.strip().str.lower().unique().tolist())
+            if unique_raw.issubset({"true", "false"}):
+                return preds_series.astype(int).map({1: "True", 0: "False"}).fillna("False")
 
-        if sample_cols[0] not in submission.columns or sample_cols[1] not in submission.columns:
-            fixed = sample_submission_df.copy()
-            if submission.shape[1] >= 2:
-                fixed.iloc[:, 0] = submission.iloc[:, 0].values[: len(fixed)]
-                fixed.iloc[:, 1] = submission.iloc[:, 1].values[: len(fixed)]
-            submission = fixed
+        return preds_series
 
-        submission = submission[sample_cols[:2]]
+    def _sanitize_submission(self, submission: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
+        fixed = sample_df.copy()
 
-        if len(submission) != len(sample_submission_df):
-            fixed = sample_submission_df.copy()
+        if submission.shape[1] >= 2:
             n = min(len(submission), len(fixed))
             fixed.iloc[:n, 0] = submission.iloc[:n, 0].values
             fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
-            submission = fixed
 
-        pred_col = sample_cols[1]
-        sample_vals = (
-            sample_submission_df[pred_col]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .unique()
-            .tolist()
-        )
+        pred_col = fixed.columns[1]
+        sample_vals = fixed[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
 
         if set(sample_vals).issubset({"true", "false"}):
-            mapped = (
-                submission[pred_col]
+            fixed[pred_col] = (
+                fixed[pred_col]
                 .astype(str)
                 .str.strip()
                 .str.lower()
-                .map({
-                    "1": "True",
-                    "0": "False",
-                    "true": "True",
-                    "false": "False",
-                })
+                .map({"1": "True", "0": "False", "true": "True", "false": "False"})
+                .fillna("False")
             )
-            submission[pred_col] = mapped.fillna("False")
-
         elif set(sample_vals).issubset({"0", "1"}):
-            mapped = (
-                submission[pred_col]
+            fixed[pred_col] = (
+                fixed[pred_col]
                 .astype(str)
                 .str.strip()
                 .str.lower()
-                .map({
-                    "1": 1,
-                    "0": 0,
-                    "true": 1,
-                    "false": 0,
-                })
+                .map({"1": 1, "0": 0, "true": 1, "false": 0})
+                .fillna(0)
+                .astype(int)
             )
-            submission[pred_col] = mapped.fillna(0).astype(int)
 
-        return submission
+        return fixed
 
-    def _fill_sample_submission(self, sample_submission_df: pd.DataFrame) -> pd.DataFrame:
-        df = sample_submission_df.copy()
+    async def _add_submission_artifact(self, updater: TaskUpdater, submission_df: pd.DataFrame) -> None:
+        csv_bytes = submission_df.to_csv(index=False).encode("utf-8")
+        b64 = base64.b64encode(csv_bytes).decode("ascii")
 
-        if len(df.columns) < 2:
-            raise ValueError("Sample submission has fewer than 2 columns.")
-
-        pred_col = df.columns[1]
-        values = df[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
-
-        if set(values).issubset({"true", "false"}):
-            df[pred_col] = "False"
-        elif set(values).issubset({"0", "1"}):
-            df[pred_col] = 0
-        else:
-            df[pred_col] = df[pred_col].fillna(0)
-
-        return df
+        await updater.add_artifact(
+            parts=[
+                Part(root=TextPart(text="Best submission.csv generated.")),
+                Part(
+                    root=FilePart(
+                        file=FileWithBytes(
+                            bytes=b64,
+                            name="submission.csv",
+                            mime_type="text/csv",
+                        )
+                    )
+                ),
+            ],
+            name="submission",
+            append=False,
+            last_chunk=True,
+        )
