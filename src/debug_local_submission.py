@@ -1,3 +1,7 @@
+from pathlib import Path
+import pandas as pd
+
+# from agent import Agent  # замени на имя файла, где лежит класс Agent
 import base64
 import io
 import json
@@ -26,17 +30,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
-from a2a.server.tasks import TaskUpdater
-from a2a.types import (
-    FilePart,
-    FileWithBytes,
-    Message,
-    Part,
-    TaskState,
-    TextPart,
-)
-from a2a.utils import new_agent_text_message
-
 
 @dataclass
 class CandidateResult:
@@ -48,116 +41,6 @@ class CandidateResult:
 class Agent:
     def __init__(self):
         self.logs: list[str] = []
-
-    async def run(self, message: Message, updater: TaskUpdater) -> None:
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message("Reading competition bundle..."),
-        )
-
-        with tempfile.TemporaryDirectory(prefix="purple-agent-") as tmpdir:
-            workdir = Path(tmpdir)
-            data_dir = self._extract_competition_bundle(message, workdir)
-
-            description = self._read_description(data_dir)
-            train_df, test_df, sample_df, paths_info = self._load_core_files(data_dir)
-
-            await updater.add_artifact(
-                parts=[
-                    Part(
-                        root=TextPart(
-                            text=json.dumps(
-                                {
-                                    "data_dir": str(data_dir),
-                                    "paths": paths_info,
-                                    "train_shape": list(train_df.shape),
-                                    "test_shape": list(test_df.shape),
-                                    "sample_shape": list(sample_df.shape),
-                                },
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-                        )
-                    )
-                ],
-                name="debug_dataset_detection.txt",
-            )
-
-            task = self._infer_task(train_df, test_df, sample_df)
-            self.logs.append(json.dumps(task, ensure_ascii=False))
-
-            await updater.update_status(
-                TaskState.working,
-                new_agent_text_message("Building features and evaluating candidate models..."),
-            )
-
-            submission_df, summary = self._solve_competition(
-                train_df=train_df,
-                test_df=test_df,
-                sample_df=sample_df,
-                description=description,
-                task=task,
-            )
-
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=summary))],
-                name="debug_report.txt",
-            )
-
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
-                name="debug_submission_preview.csv",
-            )
-            self._validate_submission(submission_df, sample_df)
-
-            await self._add_submission_artifact(updater, submission_df)
-
-            await updater.update_status(
-                TaskState.working,
-                new_agent_text_message("submission.csv uploaded."),
-            )
-
-    def _extract_competition_bundle(self, message: Message, workdir: Path) -> Path:
-        bundle_bytes = None
-
-        for part in message.parts:
-            root = part.root
-            if isinstance(root, FilePart):
-                file_obj = root.file
-                if isinstance(file_obj, FileWithBytes) and file_obj.bytes is not None:
-                    raw = file_obj.bytes
-                    if isinstance(raw, str):
-                        try:
-                            bundle_bytes = base64.b64decode(raw)
-                            break
-                        except Exception:
-                            continue
-                    elif isinstance(raw, (bytes, bytearray)):
-                        bundle_bytes = bytes(raw)
-                        break
-
-        if bundle_bytes is None:
-            raise ValueError("No competition tar.gz found in message.")
-
-        extract_root = workdir / "bundle"
-        extract_root.mkdir(parents=True, exist_ok=True)
-
-        mode = "r:gz" if bundle_bytes[:2] == b"\x1f\x8b" else "r:"
-        with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode=mode) as tar:
-            tar.extractall(extract_root)
-
-        candidates = [
-            extract_root / "home" / "data",
-            extract_root / "data",
-            extract_root,
-        ]
-        for path in candidates:
-            if path.exists():
-                csvs = list(path.rglob("*.csv"))
-                if csvs:
-                    return path
-
-        return extract_root
 
     def _read_description(self, data_dir: Path) -> str:
         for name in ["description.md", "description.txt", "README.md"]:
@@ -339,18 +222,15 @@ class Agent:
         else:
             preds = final_model.predict(X_test)
 
-        formatted_preds = self._format_predictions(
+        submission = sample_df.copy()
+        submission.iloc[:, 0] = test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values
+        submission.iloc[:, 1] = self._format_predictions(
             preds=preds,
             y_raw=y_raw,
             sample_df=sample_df,
             pred_col=pred_col,
             task_meta=task_meta,
         )
-
-        submission = pd.DataFrame({
-            sample_df.columns[0]: test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values,
-            sample_df.columns[1]: pd.Series(formatted_preds, dtype="object"),
-        })
 
         submission = self._sanitize_submission(submission, sample_df)
 
@@ -868,17 +748,6 @@ class Agent:
 
     def _sanitize_submission(self, submission: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
         fixed = sample_df.copy()
-        fixed.iloc[:, 1] = fixed.iloc[:, 1].astype("object")
-
-        original_sample_vals = (
-            sample_df.iloc[:, 1]
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .unique()
-            .tolist()
-        )
 
         if submission.shape[1] >= 2:
             n = min(len(submission), len(fixed))
@@ -886,8 +755,9 @@ class Agent:
             fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
 
         pred_col = fixed.columns[1]
+        sample_vals = fixed[pred_col].dropna().astype(str).str.strip().str.lower().unique().tolist()
 
-        if set(original_sample_vals).issubset({"true", "false"}):
+        if set(sample_vals).issubset({"true", "false"}):
             fixed[pred_col] = (
                 fixed[pred_col]
                 .astype(str)
@@ -896,7 +766,7 @@ class Agent:
                 .map({"1": "True", "0": "False", "true": "True", "false": "False"})
                 .fillna("False")
             )
-        elif set(original_sample_vals).issubset({"0", "1"}):
+        elif set(sample_vals).issubset({"0", "1"}):
             fixed[pred_col] = (
                 fixed[pred_col]
                 .astype(str)
@@ -908,37 +778,52 @@ class Agent:
             )
 
         return fixed
-    def _validate_submission(self, submission_df: pd.DataFrame, sample_df: pd.DataFrame) -> None:
-        if list(submission_df.columns) != list(sample_df.columns):
-            raise ValueError(
-                f"Expected columns {list(sample_df.columns)}, got {list(submission_df.columns)}"
-            )
-        if len(submission_df) != len(sample_df):
-            raise ValueError(
-                f"Expected {len(sample_df)} rows, got {len(submission_df)}"
-            )
-        if submission_df.isnull().any().any():
-            raise ValueError("Submission contains NaN values")
 
-            
+def main():
+    agent = Agent()
 
-    async def _add_submission_artifact(self, updater: TaskUpdater, submission_df: pd.DataFrame) -> None:
-        csv_bytes = submission_df.to_csv(index=False).encode("utf-8")
-        b64 = base64.b64encode(csv_bytes).decode("ascii")
+    # Укажи путь к папке, где уже лежат train/test/sample_submission
+    data_dir = Path("/Users/aselkarakuchukova/Desktop/итмо/research-agent/data")  # замени на свой путь
 
-        await updater.add_artifact(
-            parts=[
-                Part(
-                    root=FilePart(
-                        file=FileWithBytes(
-                            bytes=b64,
-                            name="submission.csv",
-                            mime_type="text/csv",
-                        )
-                    )
-                )
-            ],
-            name="submission.csv",
-            append=False,
-            last_chunk=True,
-        )
+    description = agent._read_description(data_dir)
+    train_df, test_df, sample_df, paths_info = agent._load_core_files(data_dir)
+    task = agent._infer_task(train_df, test_df, sample_df)
+
+    submission_df, summary = agent._solve_competition(
+        train_df=train_df,
+        test_df=test_df,
+        sample_df=sample_df,
+        description=description,
+        task=task,
+    )
+
+    print("=== PATHS ===")
+    print(paths_info)
+    print()
+
+    print("=== SUMMARY ===")
+    print(summary)
+    print()
+
+    print("=== SUBMISSION INFO ===")
+    print("shape:", submission_df.shape)
+    print("columns:", submission_df.columns.tolist())
+    print("dtypes:")
+    print(submission_df.dtypes)
+    print()
+
+    print("=== SUBMISSION HEAD ===")
+    print(submission_df.head(10))
+    print()
+
+    out_path = Path("local_submission_check.csv")
+    submission_df.to_csv(out_path, index=False, encoding="utf-8")
+    print(f"Saved submission to: {out_path.resolve()}")
+
+    sample_out_path = Path("local_sample_check.csv")
+    sample_df.to_csv(sample_out_path, index=False, encoding="utf-8")
+    print(f"Saved sample to: {sample_out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
