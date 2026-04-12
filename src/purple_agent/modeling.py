@@ -3,6 +3,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
     ExtraTreesClassifier,
@@ -15,8 +16,8 @@ from sklearn.ensemble import (
 )
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.metrics import make_scorer, mean_squared_error
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.metrics import accuracy_score, make_scorer, mean_squared_error
+from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
 
@@ -29,6 +30,14 @@ class CandidateResult:
     name: str
     score: float
     model: Any
+
+
+@dataclass(frozen=True)
+class BinaryPostprocessConfig:
+    threshold: float = 0.5
+    min_group_size: int | None = None
+    high_mean_prob: float | None = None
+    low_mean_prob: float | None = None
 
 
 def infer_task(
@@ -436,68 +445,218 @@ def evaluate_candidates(
 
 def _apply_group_consensus(
     probabilities: np.ndarray,
-    test_df: pd.DataFrame,
-    logs: list[str],
+    group_values: pd.Series,
+    config: BinaryPostprocessConfig,
+    logs: list[str] | None = None,
+    log_prefix: str = "group_consensus",
 ) -> np.ndarray:
-    if "PassengerId" not in test_df.columns:
+    if (
+        config.min_group_size is None
+        or config.high_mean_prob is None
+        or config.low_mean_prob is None
+    ):
+        return probabilities
+
+    if len(group_values) != len(probabilities):
+        if logs is not None:
+            logs.append(f"{log_prefix}: skipped (group/value length mismatch)")
         return probabilities
 
     out = probabilities.copy()
-    group_id = test_df["PassengerId"].astype(str).str.split("_", n=1).str[0]
+    group_id = group_values.astype(str).str.split("_", n=1).str[0]
     probe = pd.DataFrame({"g": group_id, "p": out})
     stats = probe.groupby("g")["p"].agg(["mean", "count"])
     mean_map = probe["g"].map(stats["mean"])
     count_map = probe["g"].map(stats["count"])
 
-    strong_high = (count_map >= 3) & (mean_map >= 0.75)
-    strong_low = (count_map >= 3) & (mean_map <= 0.25)
+    strong_high = (
+        (count_map >= config.min_group_size)
+        & (mean_map >= config.high_mean_prob)
+    )
+    strong_low = (
+        (count_map >= config.min_group_size)
+        & (mean_map <= config.low_mean_prob)
+    )
     out[strong_high.values] = np.maximum(out[strong_high.values], mean_map[strong_high].to_numpy())
     out[strong_low.values] = np.minimum(out[strong_low.values], mean_map[strong_low].to_numpy())
 
     changed = int(np.sum(strong_high.values) + np.sum(strong_low.values))
-    if changed > 0:
-        logs.append(f"group_consensus_adjusted_rows: {changed}")
+    if logs is not None:
+        logs.append(
+            (
+                f"{log_prefix}: adjusted_rows={changed} "
+                f"min_group_size={config.min_group_size} "
+                f"high_mean_prob={config.high_mean_prob:.3f} "
+                f"low_mean_prob={config.low_mean_prob:.3f}"
+            )
+        )
     return out
 
 
-def _predict_binary_with_blend(
+def _best_threshold(
+    probabilities: np.ndarray,
+    y_true: np.ndarray,
+    threshold_grid: np.ndarray,
+) -> tuple[float, float]:
+    best_threshold = 0.5
+    best_acc = -1.0
+    for t in threshold_grid:
+        acc = float(accuracy_score(y_true, (probabilities >= t).astype(int)))
+        if acc > best_acc:
+            best_acc = acc
+            best_threshold = float(t)
+    return best_threshold, best_acc
+
+
+def _tune_group_postprocess(
+    probabilities: np.ndarray,
+    y_true: np.ndarray,
+    group_values: pd.Series,
+    base_threshold: float,
+    base_accuracy: float,
+) -> tuple[BinaryPostprocessConfig, float]:
+    best_cfg = BinaryPostprocessConfig(threshold=base_threshold)
+    best_acc = base_accuracy
+
+    threshold_grid = np.linspace(0.42, 0.58, 65)
+    for min_group_size in (2, 3):
+        for high_mean_prob in (0.85, 0.875, 0.9):
+            for low_mean_prob in (0.25, 0.275, 0.3):
+                cfg = BinaryPostprocessConfig(
+                    threshold=base_threshold,
+                    min_group_size=min_group_size,
+                    high_mean_prob=high_mean_prob,
+                    low_mean_prob=low_mean_prob,
+                )
+                adjusted = _apply_group_consensus(
+                    probabilities=probabilities,
+                    group_values=group_values,
+                    config=cfg,
+                )
+                threshold, acc = _best_threshold(adjusted, y_true, threshold_grid)
+                if acc > best_acc:
+                    best_acc = acc
+                    best_cfg = BinaryPostprocessConfig(
+                        threshold=threshold,
+                        min_group_size=min_group_size,
+                        high_mean_prob=high_mean_prob,
+                        low_mean_prob=low_mean_prob,
+                    )
+
+    return best_cfg, best_acc
+
+
+def _calibrate_binary_postprocess(
+    model: Any,
+    X_train: pd.DataFrame,
+    y: pd.Series,
+    train_df: pd.DataFrame,
+    logs: list[str],
+) -> BinaryPostprocessConfig:
+    if not hasattr(model, "predict_proba"):
+        return BinaryPostprocessConfig()
+
+    try:
+        idx = np.arange(len(y))
+        X_fit, X_val, y_fit, y_val, _, idx_val = train_test_split(
+            X_train,
+            y,
+            idx,
+            test_size=0.2,
+            random_state=42,
+            stratify=y,
+        )
+
+        model_for_calibration = clone(model)
+        model_for_calibration.fit(X_fit, y_fit)
+        val_probabilities = model_for_calibration.predict_proba(X_val)[:, 1]
+
+        threshold_grid = np.linspace(0.42, 0.58, 65)
+        threshold, base_acc = _best_threshold(
+            probabilities=val_probabilities,
+            y_true=np.asarray(y_val),
+            threshold_grid=threshold_grid,
+        )
+        best_cfg = BinaryPostprocessConfig(threshold=threshold)
+        best_acc = base_acc
+
+        logs.append(
+            f"binary_threshold_calibration: threshold={threshold:.4f} accuracy={base_acc:.6f}"
+        )
+
+        if "PassengerId" in train_df.columns:
+            group_values = train_df.iloc[idx_val]["PassengerId"]
+            tuned_cfg, tuned_acc = _tune_group_postprocess(
+                probabilities=val_probabilities,
+                y_true=np.asarray(y_val),
+                group_values=group_values,
+                base_threshold=threshold,
+                base_accuracy=base_acc,
+            )
+            if tuned_acc > best_acc:
+                best_cfg = tuned_cfg
+                best_acc = tuned_acc
+                logs.append(
+                    (
+                        "binary_group_calibration: improved "
+                        f"accuracy={tuned_acc:.6f} threshold={tuned_cfg.threshold:.4f} "
+                        f"min_group_size={tuned_cfg.min_group_size} "
+                        f"high={tuned_cfg.high_mean_prob:.3f} low={tuned_cfg.low_mean_prob:.3f}"
+                    )
+                )
+            else:
+                logs.append("binary_group_calibration: no_improvement")
+
+        return best_cfg
+    except Exception as e:
+        logs.append(f"binary_postprocess_calibration_failed: {e}")
+        return BinaryPostprocessConfig()
+
+
+def _predict_binary_with_best_model(
     ranked_results: list[CandidateResult],
     X_train: pd.DataFrame,
     y: pd.Series,
     X_test: pd.DataFrame,
+    train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     logs: list[str],
 ) -> np.ndarray:
-    top = ranked_results[:4]
-    proba_preds: list[np.ndarray] = []
-    weights: list[float] = []
+    best = ranked_results[0]
+    model = best.model
+    postprocess_cfg = _calibrate_binary_postprocess(
+        model=model,
+        X_train=X_train,
+        y=y,
+        train_df=train_df,
+        logs=logs,
+    )
 
-    for r in top:
-        model = r.model
-        if not hasattr(model, "predict_proba"):
-            continue
-        try:
-            model.fit(X_train, y)
-            p = model.predict_proba(X_test)[:, 1]
-            proba_preds.append(p)
-            weight = max(1e-6, r.score)
-            weights.append(weight)
-            logs.append(f"blend_member: {r.name} weight={weight:.5f}")
-        except Exception as e:
-            logs.append(f"blend_member_failed: {r.name} ({e})")
+    model.fit(X_train, y)
+    if not hasattr(model, "predict_proba"):
+        logs.append(f"binary_inference: model={best.name} uses direct predict (no probability)")
+        return model.predict(X_test)
 
-    if not proba_preds:
-        best = ranked_results[0].model
-        best.fit(X_train, y)
-        if hasattr(best, "predict_proba"):
-            proba = best.predict_proba(X_test)[:, 1]
-            return (proba >= 0.5).astype(int)
-        return best.predict(X_test)
+    probabilities = model.predict_proba(X_test)[:, 1]
+    if (
+        "PassengerId" in test_df.columns
+        and postprocess_cfg.min_group_size is not None
+    ):
+        probabilities = _apply_group_consensus(
+            probabilities=probabilities,
+            group_values=test_df["PassengerId"],
+            config=postprocess_cfg,
+            logs=logs,
+            log_prefix="group_consensus_inference",
+        )
 
-    matrix = np.column_stack(proba_preds)
-    blend_proba = np.average(matrix, axis=1, weights=np.array(weights))
-    blend_proba = _apply_group_consensus(blend_proba, test_df=test_df, logs=logs)
-    return (blend_proba >= 0.5).astype(int)
+    logs.append(
+        (
+            f"binary_inference: model={best.name} "
+            f"threshold={postprocess_cfg.threshold:.4f}"
+        )
+    )
+    return (probabilities >= postprocess_cfg.threshold).astype(int)
 
 
 def format_predictions(
@@ -569,11 +728,12 @@ def solve_competition(
     best = ranked[0]
 
     if effective_task_type == "binary_classification":
-        preds = _predict_binary_with_blend(
+        preds = _predict_binary_with_best_model(
             ranked_results=ranked,
             X_train=X_train,
             y=y,
             X_test=X_test,
+            train_df=train_df,
             test_df=test_df,
             logs=logs,
         )
