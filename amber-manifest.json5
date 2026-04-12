@@ -17,7 +17,7 @@
   slots: {},
 
   program: {
-    image: "ghcr.io/karaselerm/research-agent:latest",
+    image: "ghcr.io/karaselerm/research-agent:019d83f2",
     entrypoint: [
       "uv",
       "run",
@@ -32,9 +32,7 @@
     env: {
       ROUTERAI_API_KEY: "${config.routerai_api_key}",
       ROUTERAI_MODEL: "${config.routerai_model}",
-      ROUTERAI_BASE_URL: "${config.routerai_base_url}",
-      OPENROUTER_API_KEY: "${config.openrouter_api_key}",
-      OPENROUTER_MODEL: "${config.openrouter_model}",
+      ROUTERAI_BASE_URL: "${config.routerai_base_url}"
     },
 
     network: {
