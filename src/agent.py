@@ -939,57 +939,13 @@ def _predict_binary_with_blend(
     test_df: pd.DataFrame,
     logs: list[str],
 ) -> np.ndarray:
-    top = ranked_results[:3]
-    proba_preds: list[np.ndarray] = []
-    weights: list[float] = []
+    _ = train_df
+    _ = test_df
 
-    postprocess_cfg = _calibrate_binary_postprocess(
-        ranked_results=ranked_results,
-        X_train=X_train,
-        y=y,
-        train_df=train_df,
-        logs=logs,
-    )
-
-    for r in top:
-        model = clone(r.model)
-        try:
-            model.fit(X_train, y)
-            if hasattr(model, "predict_proba"):
-                p = model.predict_proba(X_test)[:, 1]
-            else:
-                pred = model.predict(X_test)
-                p = np.asarray(pred, dtype=float)
-            proba_preds.append(p)
-            weight = max(1e-6, float(r.score)) ** 2
-            weights.append(weight)
-            logs.append(f"blend_member: {r.name} weight={weight:.6f}")
-        except Exception as e:
-            logs.append(f"blend_member_failed: {r.name} ({e})")
-
-    if not proba_preds:
-        best = clone(ranked_results[0].model)
-        best.fit(X_train, y)
-        if hasattr(best, "predict_proba"):
-            return (best.predict_proba(X_test)[:, 1] >= postprocess_cfg.threshold).astype(int)
-        return best.predict(X_test)
-
-    matrix = np.column_stack(proba_preds)
-    blend_proba = np.average(matrix, axis=1, weights=np.array(weights))
-    if (
-        postprocess_cfg.group_column is not None
-        and postprocess_cfg.group_column in test_df.columns
-    ):
-        blend_proba = _apply_soft_group_consensus(
-            probabilities=blend_proba,
-            group_values=test_df[postprocess_cfg.group_column],
-            config=postprocess_cfg,
-            logs=logs,
-            log_prefix=f"soft_group_consensus_{postprocess_cfg.group_column}",
-        )
-
-    logs.append(f"binary_inference_threshold: {postprocess_cfg.threshold:.4f}")
-    return (blend_proba >= postprocess_cfg.threshold).astype(int)
+    best = clone(ranked_results[0].model)
+    best.fit(X_train, y)
+    logs.append(f"binary_inference_model: {ranked_results[0].name}")
+    return best.predict(X_test)
 
 
 def format_predictions(
