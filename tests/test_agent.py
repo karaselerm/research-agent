@@ -1,13 +1,17 @@
 from typing import Any
 from pathlib import Path
+import base64
+import io
 import sys
+import tarfile
+import tempfile
 import pytest
 import httpx
 import pandas as pd
 from uuid import uuid4
 
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types import FilePart, Message, Part, Role, TextPart
+from a2a.types import FilePart, FileWithBytes, Message, Part, Role, TextPart
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -237,7 +241,9 @@ async def test_submission_artifact_uses_expected_filename_and_final_chunk():
 
     assert len(updater.calls) == 1
     call = updater.calls[0]
+    assert call["artifact_id"] == "submission"
     assert call["name"] == "submission.csv"
+    assert call["append"] is False
     assert call["last_chunk"] is True
     assert len(call["parts"]) == 1
 
@@ -245,3 +251,115 @@ async def test_submission_artifact_uses_expected_filename_and_final_chunk():
     assert isinstance(part, FilePart)
     assert part.file.name == "submission.csv"
     assert part.file.mime_type == "text/csv"
+
+
+def test_build_fallback_submission_is_valid_and_uses_test_ids():
+    agent = Agent()
+    sample_df = pd.DataFrame(
+        {
+            "PassengerId": ["0001_01", "0002_01", "0003_01"],
+            "Transported": ["False", "False", "False"],
+        }
+    )
+    test_df = pd.DataFrame(
+        {
+            "PassengerId": ["1010_01", "1011_01", "1012_01"],
+            "Feature": [1, 2, 3],
+        }
+    )
+
+    fallback_df = agent._build_fallback_submission(test_df=test_df, sample_df=sample_df)
+    agent._validate_submission(fallback_df, sample_df)
+
+    assert fallback_df.columns.tolist() == sample_df.columns.tolist()
+    assert fallback_df["PassengerId"].tolist() == test_df["PassengerId"].tolist()
+    assert set(fallback_df["Transported"].astype(str).str.lower().unique().tolist()).issubset({"true", "false"})
+
+
+@pytest.mark.asyncio
+async def test_run_submits_baseline_even_if_modeling_fails(monkeypatch):
+    class DummyUpdater:
+        def __init__(self):
+            self.status_calls = []
+            self.artifact_calls = []
+
+        async def update_status(self, state, message):
+            self.status_calls.append((state, message))
+
+        async def add_artifact(self, parts, artifact_id=None, name=None, metadata=None, append=None, last_chunk=None, extensions=None):
+            self.artifact_calls.append(
+                {
+                    "parts": parts,
+                    "artifact_id": artifact_id,
+                    "name": name,
+                    "append": append,
+                    "last_chunk": last_chunk,
+                }
+            )
+
+    train_df = pd.DataFrame(
+        {
+            "PassengerId": ["0001_01", "0002_01", "0003_01"],
+            "FeatureA": [1.0, 2.0, 3.0],
+            "Transported": ["False", "True", "False"],
+        }
+    )
+    test_df = pd.DataFrame(
+        {
+            "PassengerId": ["1001_01", "1002_01"],
+            "FeatureA": [1.5, 2.5],
+        }
+    )
+    sample_df = pd.DataFrame(
+        {
+            "PassengerId": ["xxxx_01", "yyyy_01"],
+            "Transported": ["False", "False"],
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="agent-test-") as tmpdir:
+        root = Path(tmpdir)
+        data_dir = root / "home" / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        train_df.to_csv(data_dir / "train.csv", index=False)
+        test_df.to_csv(data_dir / "test.csv", index=False)
+        sample_df.to_csv(data_dir / "sample_submission.csv", index=False)
+
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w:gz") as tar:
+            tar.add(data_dir, arcname="home/data", recursive=True)
+        tar_bytes = tar_buf.getvalue()
+
+    msg = Message(
+        kind="message",
+        role=Role.user,
+        parts=[
+            Part(
+                root=FilePart(
+                    file=FileWithBytes(
+                        bytes=base64.b64encode(tar_bytes).decode("ascii"),
+                        name="competition.tar.gz",
+                        mime_type="application/gzip",
+                    )
+                )
+            )
+        ],
+        message_id=uuid4().hex,
+    )
+
+    agent = Agent()
+
+    def _raise_modeling(*args, **kwargs):
+        raise RuntimeError("forced modeling failure")
+
+    monkeypatch.setattr(agent, "_solve_competition", _raise_modeling)
+
+    updater = DummyUpdater()
+    await agent.run(msg, updater)
+
+    assert len(updater.artifact_calls) >= 1
+    first_call = updater.artifact_calls[0]
+    assert first_call["artifact_id"] == "submission"
+    assert first_call["name"] == "submission.csv"
+    assert first_call["append"] is False
+    assert first_call["last_chunk"] is True

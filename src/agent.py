@@ -83,6 +83,23 @@ class Agent:
             #     name="debug_dataset_detection.txt",
             # )
 
+            # Submit a safe baseline early so the evaluator always receives
+            # a valid submission artifact even if later model training times out.
+            baseline_submission_df = self._build_fallback_submission(
+                test_df=test_df,
+                sample_df=sample_df,
+            )
+            self._validate_submission(baseline_submission_df, sample_df)
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message("Submitting safe baseline submission..."),
+            )
+            await self._add_submission_artifact(
+                updater=updater,
+                submission_df=baseline_submission_df,
+                artifact_id="submission",
+            )
+
             task = self._infer_task(train_df, test_df, sample_df)
             self.logs.append(json.dumps(task, ensure_ascii=False))
 
@@ -91,26 +108,41 @@ class Agent:
                 new_agent_text_message("Building features and evaluating candidate models..."),
             )
 
-            submission_df, summary = self._solve_competition(
-                train_df=train_df,
-                test_df=test_df,
-                sample_df=sample_df,
-                description=description,
-                task=task,
-            )
+            try:
+                submission_df, summary = self._solve_competition(
+                    train_df=train_df,
+                    test_df=test_df,
+                    sample_df=sample_df,
+                    description=description,
+                    task=task,
+                )
 
-            # await updater.add_artifact(
-            #     parts=[Part(root=TextPart(text=summary))],
-            #     name="debug_report.txt",
-            # )
+                # await updater.add_artifact(
+                #     parts=[Part(root=TextPart(text=summary))],
+                #     name="debug_report.txt",
+                # )
 
-            # await updater.add_artifact(
-            #     parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
-            #     name="debug_submission_preview.csv",
-            # )
-            self._validate_submission(submission_df, sample_df)
+                # await updater.add_artifact(
+                #     parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
+                #     name="debug_submission_preview.csv",
+                # )
+                self._validate_submission(submission_df, sample_df)
 
-            await self._add_submission_artifact(updater, submission_df)
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message("Uploading improved submission..."),
+                )
+                await self._add_submission_artifact(
+                    updater=updater,
+                    submission_df=submission_df,
+                    artifact_id="submission",
+                )
+            except Exception as e:
+                self.logs.append(f"fallback_used: {e}")
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message("Model training failed or timed out risk detected; using safe baseline submission."),
+                )
 
 
     def _extract_competition_bundle(self, message: Message, workdir: Path) -> Path:
@@ -864,7 +896,8 @@ class Agent:
 
     def _sanitize_submission(self, submission: pd.DataFrame, sample_df: pd.DataFrame) -> pd.DataFrame:
         fixed = sample_df.copy()
-        fixed.iloc[:, 1] = fixed.iloc[:, 1].astype("object")
+        pred_col = fixed.columns[1]
+        fixed = fixed.astype({pred_col: "object"})
 
         original_sample_vals = (
             sample_df.iloc[:, 1]
@@ -880,8 +913,6 @@ class Agent:
             n = min(len(submission), len(fixed))
             fixed.iloc[:n, 0] = submission.iloc[:n, 0].values
             fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
-
-        pred_col = fixed.columns[1]
 
         if set(original_sample_vals).issubset({"true", "false"}):
             fixed[pred_col] = (
@@ -904,6 +935,21 @@ class Agent:
             )
 
         return fixed
+
+    def _build_fallback_submission(
+        self,
+        test_df: pd.DataFrame,
+        sample_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        fallback = sample_df.copy()
+        id_col = sample_df.columns[0]
+
+        if id_col in test_df.columns:
+            n = min(len(fallback), len(test_df))
+            fallback.iloc[:n, 0] = test_df.iloc[:n][id_col].values
+
+        return self._sanitize_submission(fallback, sample_df)
+
     def _validate_submission(self, submission_df: pd.DataFrame, sample_df: pd.DataFrame) -> None:
         if list(submission_df.columns) != list(sample_df.columns):
             raise ValueError(
@@ -917,7 +963,12 @@ class Agent:
             raise ValueError("Submission contains NaN values")
 
 
-    async def _add_submission_artifact(self, updater: TaskUpdater, submission_df: pd.DataFrame) -> None:
+    async def _add_submission_artifact(
+        self,
+        updater: TaskUpdater,
+        submission_df: pd.DataFrame,
+        artifact_id: str = "submission",
+    ) -> None:
         csv_bytes = submission_df.to_csv(index=False).encode("utf-8")
         b64 = base64.b64encode(csv_bytes).decode("ascii")
 
@@ -933,6 +984,8 @@ class Agent:
                     )
                 )
             ],
+            artifact_id=artifact_id,
             name="submission.csv",
+            append=False,
             last_chunk=True,
         )
