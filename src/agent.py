@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import json
 import tempfile
@@ -35,7 +37,7 @@ class Agent:
             workdir = Path(tmpdir)
             data_dir = extract_competition_bundle(message, workdir)
 
-            _description = read_description(data_dir)
+            description = read_description(data_dir)
             train_df, test_df, sample_df, paths_info = load_core_files(data_dir)
             self.logs.append(
                 json.dumps(
@@ -54,6 +56,7 @@ class Agent:
                 sample_df=sample_df,
             )
             self._validate_submission(baseline_submission_df, sample_df)
+
             await updater.update_status(
                 TaskState.working,
                 new_agent_text_message("Submitting safe baseline submission..."),
@@ -73,13 +76,14 @@ class Agent:
             )
 
             try:
-                submission_df, _summary = self._solve_competition(
+                submission_df, summary = self._solve_competition(
                     train_df=train_df,
                     test_df=test_df,
                     sample_df=sample_df,
-                    description=_description,
+                    description=description,
                     task=task,
                 )
+                self.logs.append(summary)
                 self._validate_submission(submission_df, sample_df)
 
                 await updater.update_status(
@@ -96,11 +100,10 @@ class Agent:
                 await updater.update_status(
                     TaskState.working,
                     new_agent_text_message(
-                        "Model training failed or timed out risk detected; using safe baseline submission."
+                        "Model training failed or suspicious submission detected; using safe baseline submission."
                     ),
                 )
 
-    # Compatibility wrappers kept for tests and readable orchestration.
     def _solve_competition(
         self,
         train_df: pd.DataFrame,

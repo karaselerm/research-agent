@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import io
 import tarfile
@@ -34,7 +36,7 @@ def extract_competition_bundle(message: Message, workdir: Path) -> Path:
 
     mode = "r:gz" if bundle_bytes[:2] == b"\x1f\x8b" else "r:"
     with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode=mode) as tar:
-        tar.extractall(extract_root)
+        tar.extractall(extract_root, filter="data")
 
     candidates = [
         extract_root / "home" / "data",
@@ -104,16 +106,17 @@ def load_core_files(
     if sample_path is None:
         for p in csv_paths:
             df = _read_csv_any(p)
-            if df is not None and df.shape[1] == 2:
-                first, second = df.columns[0], df.columns[1]
-                if first.lower().endswith("id") or second.lower() in {
-                    "target",
-                    "transported",
-                    "survived",
-                    "label",
-                }:
-                    sample_path = p
-                    break
+            if df is None or df.shape[1] != 2:
+                continue
+            first, second = df.columns[0], df.columns[1]
+            if first.lower().endswith("id") or second.lower() in {
+                "target",
+                "transported",
+                "survived",
+                "label",
+            }:
+                sample_path = p
+                break
 
     if train_path is None or test_path is None or sample_path is None:
         raise ValueError(

@@ -9,11 +9,11 @@ from a2a.client import (
     Consumer,
 )
 from a2a.types import (
+    DataPart,
     Message,
     Part,
     Role,
     TextPart,
-    DataPart,
 )
 
 
@@ -50,7 +50,6 @@ async def send_message(
     timeout: int = DEFAULT_TIMEOUT,
     consumer: Consumer | None = None,
 ):
-    """Returns dict with context_id, response and status (if exists)"""
     async with httpx.AsyncClient(timeout=timeout) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
         agent_card = await resolver.get_agent_card()
@@ -67,7 +66,6 @@ async def send_message(
         last_event = None
         outputs = {"response": "", "context_id": None}
 
-        # if streaming == False, only one event is generated
         async for event in client.send_message(outbound_msg):
             last_event = event
 
@@ -103,18 +101,6 @@ class Messenger:
         new_conversation: bool = False,
         timeout: int = DEFAULT_TIMEOUT,
     ):
-        """
-        Communicate with another agent by sending a message and receiving their response.
-
-        Args:
-            message: The message to send to the agent
-            url: The agent's URL endpoint
-            new_conversation: If True, start fresh conversation; if False, continue existing conversation
-            timeout: Timeout in seconds for the request (default: 300)
-
-        Returns:
-            str: The agent's response message
-        """
         outputs = await send_message(
             message=message,
             base_url=url,

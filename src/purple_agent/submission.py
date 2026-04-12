@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pandas as pd
 
 
@@ -9,7 +11,7 @@ def sanitize_submission(
     pred_col = fixed.columns[1]
     fixed = fixed.astype({pred_col: "object"})
 
-    original_sample_vals = (
+    sample_vals = (
         sample_df.iloc[:, 1]
         .dropna()
         .astype(str)
@@ -24,7 +26,7 @@ def sanitize_submission(
         fixed.iloc[:n, 0] = submission.iloc[:n, 0].values
         fixed.iloc[:n, 1] = submission.iloc[:n, 1].values
 
-    if set(original_sample_vals).issubset({"true", "false"}):
+    if set(sample_vals).issubset({"true", "false"}):
         fixed[pred_col] = (
             fixed[pred_col]
             .astype(str)
@@ -33,7 +35,7 @@ def sanitize_submission(
             .map({"1": "True", "0": "False", "true": "True", "false": "False"})
             .fillna("False")
         )
-    elif set(original_sample_vals).issubset({"0", "1"}):
+    elif set(sample_vals).issubset({"0", "1"}):
         fixed[pred_col] = (
             fixed[pred_col]
             .astype(str)
@@ -66,9 +68,15 @@ def validate_submission(submission_df: pd.DataFrame, sample_df: pd.DataFrame) ->
         raise ValueError(
             f"Expected columns {list(sample_df.columns)}, got {list(submission_df.columns)}"
         )
+
     if len(submission_df) != len(sample_df):
         raise ValueError(
             f"Expected {len(sample_df)} rows, got {len(submission_df)}"
         )
+
     if submission_df.isnull().any().any():
         raise ValueError("Submission contains NaN values")
+
+    pred_col = sample_df.columns[1]
+    if len(submission_df) >= 20 and submission_df[pred_col].nunique(dropna=False) <= 1:
+        raise ValueError("Submission predictions are constant")

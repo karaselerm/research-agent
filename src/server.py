@@ -1,6 +1,6 @@
 import argparse
-import uvicorn
 
+import uvicorn
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore
@@ -19,18 +19,18 @@ def main() -> None:
     skill = AgentSkill(
         id="research_ml_reasoning",
         name="Research & ML Reasoning",
-        description="Answers research-style and ML-engineering prompts with concise structured reasoning.",
-        tags=["research", "analysis", "ml", "reasoning"],
+        description="Solves generic MLE-bench style tabular competitions with robust feature synthesis and model selection.",
+        tags=["research", "analysis", "ml", "tabular", "mle-bench"],
         examples=[
-            "Summarize the likely causes of underfitting and suggest fixes.",
-            "Compare two machine learning approaches for a practical task.",
-            "Give a concise research-style answer with assumptions and next steps.",
+            "Solve a generic Kaggle-style tabular competition bundle.",
+            "Infer target and build a submission from train/test/sample files.",
+            "Evaluate multiple tabular model families and upload submission.csv.",
         ],
     )
 
     agent_card = AgentCard(
         name="Karaselerm Research Agent",
-        description="A purple agent for the AgentBeats Research track.",
+        description="A generic purple agent for AgentBeats MLE-bench runs.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version="1.0.0",
         default_input_modes=["text", "file"],
