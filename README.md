@@ -1,15 +1,24 @@
 # Research Agent
 
-A purple A2A-compatible agent for the AgentBeats Research track.
+Purple A2A agent for AgentBeats MLE-bench runs.
 
-## What it does
+## Project layout
 
-This agent answers research-style and ML-engineering prompts with concise structured reasoning.
-
-It supports:
-- local execution without API keys via deterministic fallback logic
-- OpenRouter-backed responses when `OPENROUTER_API_KEY` is provided
-- A2A-compatible packaging for AgentBeats
+```text
+src/
+  server.py                  # A2A server bootstrap and agent card
+  executor.py                # Task execution lifecycle
+  agent.py                   # Thin orchestration layer
+  messenger.py               # A2A messaging helpers
+  purple_agent/
+    io_bundle.py             # Bundle extraction and CSV discovery
+    features.py              # Tabular feature engineering
+    modeling.py              # Candidate models and blending logic
+    submission.py            # Submission normalization/validation
+tests/
+  conftest.py
+  test_agent.py
+```
 
 ## Local run
 
@@ -18,25 +27,24 @@ uv sync
 uv run src/server.py
 ```
 
-The agent will run on: http://127.0.0.1:9009
+Agent URL: `http://127.0.0.1:9009`
 
-## Run tests
-```
+## Test
+
+```bash
 uv sync --extra test
 uv run pytest --agent-url http://localhost:9009
 ```
-## Docker
+
+Unit-only fast check:
+
+```bash
+uv run pytest tests/test_agent.py -k "submission_artifact or fallback_submission or run_submits_baseline" -q
 ```
+
+## Docker
+
+```bash
 docker build -t research-agent .
 docker run -p 9009:9009 research-agent
 ```
-## Optional environment variables
-* ```OPENROUTER_API_KEY```
-* ```OPENROUTER_MODEL```
-
-If no API key is set, the agent uses local fallback logic so A2A tests still pass.
-
-## .env.example
-```OPENROUTER_API_KEY=your_openrouter_key_here```
-
-```OPENROUTER_MODEL=openrouter/free```
