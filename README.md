@@ -1,4 +1,4 @@
-# Kartoshechko Research Agent
+# Research Agent
 
 A purple A2A-compatible agent for the AgentBeats Research track.
 
