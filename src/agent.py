@@ -933,5 +933,6 @@ class Agent:
                     )
                 )
             ],
-            name="submission",
+            name="submission.csv",
+            last_chunk=True,
         )

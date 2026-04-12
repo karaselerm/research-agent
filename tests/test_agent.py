@@ -1,10 +1,17 @@
 from typing import Any
+from pathlib import Path
+import sys
 import pytest
 import httpx
+import pandas as pd
 from uuid import uuid4
 
 from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-from a2a.types import Message, Part, Role, TextPart
+from a2a.types import FilePart, Message, Part, Role, TextPart
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agent import Agent
 
 
 # A2A validation helpers - adapted from https://github.com/a2aproject/a2a-inspector/blob/main/backend/validators.py
@@ -197,3 +204,44 @@ async def test_message(agent, streaming):
     assert not all_errors, f"Message validation failed:\n" + "\n".join(all_errors)
 
 # Add your custom tests here
+
+
+@pytest.mark.asyncio
+async def test_submission_artifact_uses_expected_filename_and_final_chunk():
+    class DummyUpdater:
+        def __init__(self):
+            self.calls = []
+
+        async def add_artifact(self, parts, artifact_id=None, name=None, metadata=None, append=None, last_chunk=None, extensions=None):
+            self.calls.append(
+                {
+                    "parts": parts,
+                    "artifact_id": artifact_id,
+                    "name": name,
+                    "metadata": metadata,
+                    "append": append,
+                    "last_chunk": last_chunk,
+                    "extensions": extensions,
+                }
+            )
+
+    submission_df = pd.DataFrame(
+        {
+            "PassengerId": ["0013_01", "0018_01"],
+            "Transported": ["True", "False"],
+        }
+    )
+    updater = DummyUpdater()
+
+    await Agent()._add_submission_artifact(updater, submission_df)
+
+    assert len(updater.calls) == 1
+    call = updater.calls[0]
+    assert call["name"] == "submission.csv"
+    assert call["last_chunk"] is True
+    assert len(call["parts"]) == 1
+
+    part = call["parts"][0].root
+    assert isinstance(part, FilePart)
+    assert part.file.name == "submission.csv"
+    assert part.file.mime_type == "text/csv"
