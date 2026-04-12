@@ -62,26 +62,26 @@ class Agent:
             description = self._read_description(data_dir)
             train_df, test_df, sample_df, paths_info = self._load_core_files(data_dir)
 
-            await updater.add_artifact(
-                parts=[
-                    Part(
-                        root=TextPart(
-                            text=json.dumps(
-                                {
-                                    "data_dir": str(data_dir),
-                                    "paths": paths_info,
-                                    "train_shape": list(train_df.shape),
-                                    "test_shape": list(test_df.shape),
-                                    "sample_shape": list(sample_df.shape),
-                                },
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-                        )
-                    )
-                ],
-                name="debug_dataset_detection.txt",
-            )
+            # # await updater.add_artifact(
+            #     parts=[
+            #         Part(
+            #             root=TextPart(
+            #                 text=json.dumps(
+            #                     {
+            #                         "data_dir": str(data_dir),
+            #                         "paths": paths_info,
+            #                         "train_shape": list(train_df.shape),
+            #                         "test_shape": list(test_df.shape),
+            #                         "sample_shape": list(sample_df.shape),
+            #                     },
+            #                     ensure_ascii=False,
+            #                     indent=2,
+            #                 )
+            #             )
+            #         )
+            #     ],
+            #     name="debug_dataset_detection.txt",
+            # )
 
             task = self._infer_task(train_df, test_df, sample_df)
             self.logs.append(json.dumps(task, ensure_ascii=False))
@@ -99,21 +99,21 @@ class Agent:
                 task=task,
             )
 
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=summary))],
-                name="debug_report.txt",
-            )
+            # await updater.add_artifact(
+            #     parts=[Part(root=TextPart(text=summary))],
+            #     name="debug_report.txt",
+            # )
 
-            await updater.add_artifact(
-                parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
-                name="debug_submission_preview.csv",
-            )
+            # await updater.add_artifact(
+            #     parts=[Part(root=TextPart(text=submission_df.head(20).to_csv(index=False)))],
+            #     name="debug_submission_preview.csv",
+            # )
             self._validate_submission(submission_df, sample_df)
 
             await self._add_submission_artifact(updater, submission_df)
 
             await updater.update_status(
-                TaskState.working,
+                TaskState.completed,
                 new_agent_text_message("submission.csv uploaded."),
             )
 
@@ -920,7 +920,6 @@ class Agent:
         if submission_df.isnull().any().any():
             raise ValueError("Submission contains NaN values")
 
-            
 
     async def _add_submission_artifact(self, updater: TaskUpdater, submission_df: pd.DataFrame) -> None:
         csv_bytes = submission_df.to_csv(index=False).encode("utf-8")
@@ -938,7 +937,5 @@ class Agent:
                     )
                 )
             ],
-            name="submission.csv",
-            append=False,
-            last_chunk=True,
+            name="submission",
         )
