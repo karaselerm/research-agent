@@ -718,6 +718,81 @@ def _best_threshold(
     return best_threshold, best_acc
 
 
+def _select_group_consensus_spec(
+    train_df: pd.DataFrame,
+    y: pd.Series,
+    min_groups: int = 12,
+    min_group_size: int = 2,
+    min_gain: float = 0.03,
+) -> tuple[str, str, float] | None:
+    if len(train_df) != len(y):
+        return None
+
+    baseline = float(max(y.mean(), 1.0 - y.mean()))
+    best: tuple[str, str, float] | None = None
+    best_gain = min_gain
+
+    candidate_cols = _candidate_structured_string_columns(train_df)
+    for col in candidate_cols:
+        s = train_df[col].fillna("").astype(str)
+        sample = s.head(500)
+        for sep in _SEPARATORS:
+            if sample.str.contains(re.escape(sep), regex=True).mean() < 0.6:
+                continue
+
+            group = s.str.split(sep, n=1).str[0]
+            probe = pd.DataFrame({"g": group, "y": y.to_numpy()})
+            stats = probe.groupby("g")["y"].agg(["mean", "count"])
+            stats = stats[stats["count"] >= min_group_size]
+            if len(stats) < min_groups:
+                continue
+
+            purity = float(
+                np.average(
+                    np.maximum(stats["mean"].to_numpy(), 1.0 - stats["mean"].to_numpy()),
+                    weights=stats["count"].to_numpy(),
+                )
+            )
+            gain = purity - baseline
+            if gain > best_gain:
+                best_gain = gain
+                best = (col, sep, gain)
+            break
+
+    return best
+
+
+def _apply_group_consensus_on_test_proba(
+    probabilities: np.ndarray,
+    test_df: pd.DataFrame,
+    group_col: str,
+    sep: str,
+    logs: list[str] | None = None,
+) -> np.ndarray:
+    if group_col not in test_df.columns or len(test_df) != len(probabilities):
+        return probabilities
+
+    s = test_df[group_col].fillna("").astype(str)
+    group = s.str.split(sep, n=1).str[0]
+    probe = pd.DataFrame({"g": group, "p": probabilities})
+    stats = probe.groupby("g")["p"].agg(["mean", "count"])
+
+    mean_map = probe["g"].map(stats["mean"]).to_numpy()
+    count_map = probe["g"].map(stats["count"]).to_numpy()
+    out = probabilities.copy()
+
+    high_mask = (count_map >= 2) & (mean_map >= 0.88)
+    low_mask = (count_map >= 2) & (mean_map <= 0.12)
+    out[high_mask] = np.maximum(out[high_mask], mean_map[high_mask])
+    out[low_mask] = np.minimum(out[low_mask], mean_map[low_mask])
+
+    if logs is not None:
+        logs.append(
+            f"group_consensus_applied: col={group_col} adjusted_rows={int(high_mask.sum() + low_mask.sum())}"
+        )
+    return out
+
+
 def _predict_binary_with_blend(
     ranked_results: list[CandidateResult],
     X_train: pd.DataFrame,
@@ -777,13 +852,24 @@ def _predict_binary_with_blend(
         oof_seen[valid_idx] = True
 
     if int(oof_seen.sum()) >= max(10, int(0.8 * len(y))):
-        threshold_grid = np.linspace(0.35, 0.65, 61)
+        threshold_grid = np.linspace(0.45, 0.55, 41)
         threshold, oof_acc = _best_threshold(
             probabilities=oof_proba[oof_seen],
             y_true=y.iloc[oof_seen].to_numpy(),
             threshold_grid=threshold_grid,
         )
-        logs.append(f"binary_blend_threshold: {threshold:.4f} oof_acc={oof_acc:.6f}")
+        acc_at_05 = float(
+            accuracy_score(
+                y.iloc[oof_seen].to_numpy(),
+                (oof_proba[oof_seen] >= 0.5).astype(int),
+            )
+        )
+        # Keep threshold stable unless tuning gives a meaningful gain.
+        if oof_acc - acc_at_05 < 0.002:
+            threshold = 0.5
+        logs.append(
+            f"binary_blend_threshold: {threshold:.4f} oof_acc={oof_acc:.6f} acc_at_05={acc_at_05:.6f}"
+        )
     else:
         threshold = 0.5
         logs.append("binary_blend_threshold: default=0.5000 (insufficient_oof)")
@@ -812,6 +898,17 @@ def _predict_binary_with_blend(
         axis=1,
         weights=np.asarray(test_weights, dtype=float),
     )
+    group_spec = _select_group_consensus_spec(train_df=train_df, y=y)
+    if group_spec is not None:
+        group_col, sep, gain = group_spec
+        logs.append(f"group_consensus_selected: col={group_col} gain={gain:.4f}")
+        blended_test_proba = _apply_group_consensus_on_test_proba(
+            probabilities=blended_test_proba,
+            test_df=test_df,
+            group_col=group_col,
+            sep=sep,
+            logs=logs,
+        )
     return (blended_test_proba >= threshold).astype(int)
 
 
@@ -906,11 +1003,9 @@ def solve_competition(
     y_raw = train_df[target_col].copy()
     X_train_raw = train_df.drop(columns=[target_col], errors="ignore")
     X_test_raw = test_df.copy()
-
-    if id_col in X_train_raw.columns:
-        X_train_raw = X_train_raw.drop(columns=[id_col], errors="ignore")
-    if id_col in X_test_raw.columns:
-        X_test_raw = X_test_raw.drop(columns=[id_col], errors="ignore")
+    # Keep id-like columns for generic structural feature extraction.
+    # Raw id columns are dropped later in make_features, but their split/group
+    # patterns can provide transferable signal without task-specific hardcoding.
 
     X_train = make_features(X_train_raw, train_df)
     X_test = make_features(X_test_raw, test_df)
