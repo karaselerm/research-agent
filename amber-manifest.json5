@@ -19,7 +19,16 @@
 
   program: {
     image: "ghcr.io/karaselerm/research-agent:latest",
-    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9009",
+    entrypoint: [
+      "uv",
+      "run",
+      "python",
+      "src/server.py",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "9009",
+    ],
 
     env: {
       ROUTERAI_API_KEY: "${config.routerai_api_key}",
