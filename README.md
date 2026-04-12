@@ -42,4 +42,4 @@ If no API key is set, the agent uses local fallback logic so A2A tests still pas
 
 ```env
 OPENROUTER_API_KEY=your_openrouter_key_here
-OPENROUTER_MODEL=deepseek/deepseek-chat-v3-0324
+OPENROUTER_MODEL=openrouter/free
