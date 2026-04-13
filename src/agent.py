@@ -464,6 +464,7 @@ def _add_target_encoding_features(
     logs: list[str] | None = None,
     max_cols: int = 8,
     smoothing: float = 20.0,
+    n_splits: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if task_type == "classification" and int(y.nunique(dropna=True)) > 2:
         # Mean encoding for multiclass (as scalar) is often noisy.
@@ -496,15 +497,17 @@ def _add_target_encoding_features(
     selected_cols = [col for _, col in scored[:max_cols]]
 
     if task_type in {"binary_classification", "classification"}:
+        split_count = n_splits if n_splits is not None else (5 if len(y) >= 500 else 4)
         splitter = StratifiedKFold(
-            n_splits=5 if len(y) >= 500 else 4,
+            n_splits=max(2, int(split_count)),
             shuffle=True,
             random_state=42,
         )
         def _iter_splits():
             return splitter.split(train, y)
     else:
-        splitter = KFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        split_count = n_splits if n_splits is not None else (5 if len(y) >= 500 else 4)
+        splitter = KFold(n_splits=max(2, int(split_count)), shuffle=True, random_state=42)
         def _iter_splits():
             return splitter.split(train)
 
@@ -956,6 +959,66 @@ def _predict_binary_with_single_model(
     return (test_proba >= threshold).astype(int)
 
 
+def _predict_binary_with_fast_blend(
+    ranked_results: list[CandidateResult],
+    X_train: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    logs: list[str],
+) -> np.ndarray:
+    members = [r for r in ranked_results[:3] if hasattr(r.model, "predict_proba")]
+    if len(members) < 2:
+        return _predict_binary_with_single_model(
+            best=ranked_results[0],
+            X_train=X_train,
+            y=y,
+            X_test=X_test,
+            logs=logs,
+            tune_threshold=not _SAFE_MODE,
+        )
+
+    score_vec = np.array([max(1e-6, float(m.score)) for m in members], dtype=float)
+    weights = score_vec / score_vec.sum()
+    for member, weight in zip(members, weights):
+        logs.append(f"binary_fast_blend_member: {member.name} weight={weight:.4f}")
+
+    threshold = 0.5
+    if not _SAFE_MODE and len(y) >= 350:
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        oof = np.full(len(y), np.nan, dtype=float)
+        for train_idx, valid_idx in cv.split(X_train, y):
+            fold_proba = np.zeros(len(valid_idx), dtype=float)
+            for weight, member in zip(weights, members):
+                model = clone(member.model)
+                model.fit(X_train.iloc[train_idx], y.iloc[train_idx])
+                fold_proba += weight * model.predict_proba(X_train.iloc[valid_idx])[:, 1]
+            oof[valid_idx] = fold_proba
+
+        mask = np.isfinite(oof)
+        if int(mask.sum()) >= max(100, int(0.8 * len(y))):
+            candidate_thresholds = np.linspace(0.46, 0.54, 17)
+            tuned_threshold, tuned_acc = _best_threshold(
+                probabilities=oof[mask],
+                y_true=y.iloc[mask].to_numpy(),
+                threshold_grid=candidate_thresholds,
+            )
+            base_acc = float(accuracy_score(y.iloc[mask].to_numpy(), (oof[mask] >= 0.5).astype(int)))
+            if tuned_acc >= base_acc + 0.001:
+                threshold = tuned_threshold
+            logs.append(
+                f"binary_fast_blend_threshold: base_acc={base_acc:.6f} tuned_acc={tuned_acc:.6f} threshold={threshold:.4f}"
+            )
+
+    test_proba = np.zeros(len(X_test), dtype=float)
+    for weight, member in zip(weights, members):
+        model = clone(member.model)
+        model.fit(X_train, y)
+        test_proba += weight * model.predict_proba(X_test)[:, 1]
+
+    logs.append(f"binary_fast_blend_selected: threshold={threshold:.4f} members={len(members)}")
+    return (test_proba >= threshold).astype(int)
+
+
 def _select_group_consensus_spec(
     train_df: pd.DataFrame,
     y: pd.Series,
@@ -1294,25 +1357,30 @@ def solve_competition(
     # patterns can provide transferable signal without task-specific hardcoding.
 
     feature_started = time.perf_counter()
-    X_train = make_features(X_train_raw, train_df)
-    X_test = make_features(X_test_raw, test_df)
+    combined_raw = pd.concat([X_train_raw, X_test_raw], axis=0, ignore_index=True)
+    combined_features = make_features(combined_raw, combined_raw)
+    train_rows = len(X_train_raw)
+    X_train = combined_features.iloc[:train_rows].reset_index(drop=True)
+    X_test = combined_features.iloc[train_rows:].reset_index(drop=True)
     X_test = align_columns(X_train, X_test)
     logs.append(f"feature_time_sec={time.perf_counter() - feature_started:.2f}")
     logs.append(f"n_features_after_engineering={X_train.shape[1]}")
 
     y, task_meta = prepare_target(y_raw, task_type)
     effective_task_type = task_meta["task_type"]
-    if not _FAST_MODE:
+    if not _SAFE_MODE:
         X_train, X_test = _add_target_encoding_features(
             X_train=X_train,
             X_test=X_test,
             y=y,
             task_type=effective_task_type,
             logs=logs,
+            max_cols=4 if _FAST_MODE else 8,
+            n_splits=3 if _FAST_MODE else None,
         )
         X_test = align_columns(X_train, X_test)
     else:
-        logs.append("target_encoding_skipped_in_fast_mode")
+        logs.append("target_encoding_skipped_in_safe_mode")
 
     logs.append(f"agent_mode={_AGENT_MODE}")
     candidates = build_candidates(X_train, effective_task_type)
@@ -1320,7 +1388,15 @@ def solve_competition(
     ranked = evaluate_candidates(X_train, y, candidates, effective_task_type, logs=logs)
     best = ranked[0]
 
-    if effective_task_type == "binary_classification" and not _FAST_MODE:
+    if effective_task_type == "binary_classification" and _FAST_MODE:
+        preds = _predict_binary_with_fast_blend(
+            ranked_results=ranked,
+            X_train=X_train,
+            y=y,
+            X_test=X_test,
+            logs=logs,
+        )
+    elif effective_task_type == "binary_classification":
         preds = _predict_binary_with_blend(
             ranked_results=ranked,
             X_train=X_train,
@@ -1329,15 +1405,6 @@ def solve_competition(
             train_df=train_df,
             test_df=test_df,
             logs=logs,
-        )
-    elif effective_task_type == "binary_classification":
-        preds = _predict_binary_with_single_model(
-            best=best,
-            X_train=X_train,
-            y=y,
-            X_test=X_test,
-            logs=logs,
-            tune_threshold=not _SAFE_MODE,
         )
     else:
         final_model = clone(best.model)
