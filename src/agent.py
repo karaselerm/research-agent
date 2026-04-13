@@ -380,9 +380,15 @@ def _make_bool_numeric_interactions(
     return out
 
 
-def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+def make_features(
+    X: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    *,
+    include_expensive_features: bool | None = None,
+) -> pd.DataFrame:
     started = time.perf_counter()
     X = X.copy()
+    expensive = (not _FAST_MODE) if include_expensive_features is None else include_expensive_features
 
     for col in X.columns:
         if _is_numeric_like_object(X[col]):
@@ -422,7 +428,7 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
             X = pd.concat([X, _split_structured_column(raw_df[col], col)], axis=1)
 
     X = pd.concat([X, _make_numeric_aggregates(X)], axis=1)
-    if not _FAST_MODE:
+    if expensive:
         X = pd.concat([X, _make_group_aggregates(X, raw_df)], axis=1)
         X = pd.concat([X, _make_bool_numeric_interactions(X)], axis=1)
 
@@ -440,7 +446,7 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
         "make_features finished in %.2fs with %d columns (mode=%s)",
         time.perf_counter() - started,
         X.shape[1],
-        _AGENT_MODE,
+        f"{_AGENT_MODE}:{'exp' if expensive else 'lean'}",
     )
     return X
 
@@ -856,6 +862,7 @@ def evaluate_candidates(
     candidates: list[tuple[str, Any]],
     task_type: str,
     logs: list[str],
+    cv_seed: int = 42,
 ) -> list[CandidateResult]:
     results: list[CandidateResult] = []
     started = time.perf_counter()
@@ -867,7 +874,7 @@ def evaluate_candidates(
             n_splits = 3
         else:
             n_splits = 5 if len(y) >= 500 else 4
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cv_seed)
         scoring = "accuracy"
     else:
         if _SAFE_MODE:
@@ -876,7 +883,7 @@ def evaluate_candidates(
             n_splits = 3
         else:
             n_splits = 5 if len(y) >= 500 else 4
-        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=cv_seed)
         scoring = make_scorer(lambda yt, yp: -float(np.sqrt(mean_squared_error(yt, yp))), greater_is_better=True)
 
     for name, model in candidates:
@@ -1352,80 +1359,200 @@ def solve_competition(
     y_raw = train_df[target_col].copy()
     X_train_raw = train_df.drop(columns=[target_col], errors="ignore")
     X_test_raw = test_df.copy()
-    # Keep id-like columns for generic structural feature extraction.
-    # Raw id columns are dropped later in make_features, but their split/group
-    # patterns can provide transferable signal without task-specific hardcoding.
-
-    feature_started = time.perf_counter()
-    combined_raw = pd.concat([X_train_raw, X_test_raw], axis=0, ignore_index=True)
-    combined_features = make_features(combined_raw, combined_raw)
-    train_rows = len(X_train_raw)
-    X_train = combined_features.iloc[:train_rows].reset_index(drop=True)
-    X_test = combined_features.iloc[train_rows:].reset_index(drop=True)
-    X_test = align_columns(X_train, X_test)
-    logs.append(f"feature_time_sec={time.perf_counter() - feature_started:.2f}")
-    logs.append(f"n_features_after_engineering={X_train.shape[1]}")
-
     y, task_meta = prepare_target(y_raw, task_type)
     effective_task_type = task_meta["task_type"]
-    if not _SAFE_MODE:
-        X_train, X_test = _add_target_encoding_features(
-            X_train=X_train,
-            X_test=X_test,
-            y=y,
-            task_type=effective_task_type,
-            logs=logs,
-            max_cols=4 if _FAST_MODE else 8,
-            n_splits=3 if _FAST_MODE else None,
-        )
-        X_test = align_columns(X_train, X_test)
+
+    # Structural pass@k idea (from arena-style agents), but inside one process:
+    # run multiple independent strategy seeds and pick the highest-CV output.
+    if _SAFE_MODE:
+        strategy_specs = [
+            {
+                "name": "safe_baseline",
+                "expensive_features": False,
+                "target_encoding": False,
+                "max_te_cols": 0,
+                "blend_mode": "single",
+                "cv_seed": 42,
+            }
+        ]
+    elif _FAST_MODE:
+        strategy_specs = [
+            {
+                "name": "quick_baseline",
+                "expensive_features": False,
+                "target_encoding": False,
+                "max_te_cols": 0,
+                "blend_mode": "single",
+                "cv_seed": 42,
+            },
+            {
+                "name": "data_first",
+                "expensive_features": True,
+                "target_encoding": True,
+                "max_te_cols": 4,
+                "blend_mode": "fast",
+                "cv_seed": 314,
+            },
+        ]
     else:
-        logs.append("target_encoding_skipped_in_safe_mode")
+        strategy_specs = [
+            {
+                "name": "quick_baseline",
+                "expensive_features": False,
+                "target_encoding": False,
+                "max_te_cols": 0,
+                "blend_mode": "single",
+                "cv_seed": 42,
+            },
+            {
+                "name": "data_first",
+                "expensive_features": True,
+                "target_encoding": True,
+                "max_te_cols": 8,
+                "blend_mode": "fast",
+                "cv_seed": 314,
+            },
+            {
+                "name": "full_blend",
+                "expensive_features": True,
+                "target_encoding": True,
+                "max_te_cols": 8,
+                "blend_mode": "full",
+                "cv_seed": 2718,
+            },
+        ]
 
     logs.append(f"agent_mode={_AGENT_MODE}")
-    candidates = build_candidates(X_train, effective_task_type)
-    logs.append(f"candidate_count={len(candidates)}")
-    ranked = evaluate_candidates(X_train, y, candidates, effective_task_type, logs=logs)
-    best = ranked[0]
+    logs.append(f"strategy_count={len(strategy_specs)}")
 
-    if effective_task_type == "binary_classification" and _FAST_MODE:
-        preds = _predict_binary_with_fast_blend(
-            ranked_results=ranked,
-            X_train=X_train,
-            y=y,
-            X_test=X_test,
-            logs=logs,
-        )
-    elif effective_task_type == "binary_classification":
-        preds = _predict_binary_with_blend(
-            ranked_results=ranked,
-            X_train=X_train,
-            y=y,
-            X_test=X_test,
-            train_df=train_df,
-            test_df=test_df,
-            logs=logs,
-        )
-    else:
-        final_model = clone(best.model)
-        final_model.fit(X_train, y)
-        preds = final_model.predict(X_test)
+    combined_raw = pd.concat([X_train_raw, X_test_raw], axis=0, ignore_index=True)
+    train_rows = len(X_train_raw)
+    started_total = time.perf_counter()
 
-    formatted_preds = format_predictions(
-        preds=preds,
-        y_raw=y_raw,
-        sample_df=sample_df,
-        pred_col=pred_col,
-        task_meta=task_meta,
-    )
+    best_submission: pd.DataFrame | None = None
+    best_score = float("-inf")
+    best_model_name = "<none>"
+    best_strategy_name = "<none>"
 
-    submission = pd.DataFrame(
-        {
-            sample_df.columns[0]: test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values,
-            sample_df.columns[1]: pd.Series(formatted_preds, dtype="object"),
-        }
-    )
-    submission = sanitize_submission(submission, sample_df)
+    for idx, spec in enumerate(strategy_specs, start=1):
+        elapsed = time.perf_counter() - started_total
+        budget = float(_SOLVE_TIMEOUT_SEC)
+        if elapsed > budget * 0.82 and best_submission is not None:
+            logs.append(
+                f"strategy_budget_stop: elapsed={elapsed:.2f}s budget={budget:.2f}s completed={idx-1}"
+            )
+            break
+
+        s_name = str(spec["name"])
+        s_logs: list[str] = []
+        s_logs.append(f"strategy_start: {s_name}")
+        try:
+            feature_started = time.perf_counter()
+            combined_features = make_features(
+                combined_raw,
+                combined_raw,
+                include_expensive_features=bool(spec["expensive_features"]),
+            )
+            X_train = combined_features.iloc[:train_rows].reset_index(drop=True)
+            X_test = combined_features.iloc[train_rows:].reset_index(drop=True)
+            X_test = align_columns(X_train, X_test)
+            s_logs.append(f"feature_time_sec={time.perf_counter() - feature_started:.2f}")
+            s_logs.append(f"n_features_after_engineering={X_train.shape[1]}")
+
+            if bool(spec["target_encoding"]):
+                X_train, X_test = _add_target_encoding_features(
+                    X_train=X_train,
+                    X_test=X_test,
+                    y=y,
+                    task_type=effective_task_type,
+                    logs=s_logs,
+                    max_cols=int(spec["max_te_cols"]),
+                    n_splits=3 if _FAST_MODE else None,
+                )
+                X_test = align_columns(X_train, X_test)
+            else:
+                s_logs.append("target_encoding_skipped")
+
+            candidates = build_candidates(X_train, effective_task_type)
+            s_logs.append(f"candidate_count={len(candidates)}")
+            ranked = evaluate_candidates(
+                X_train,
+                y,
+                candidates,
+                effective_task_type,
+                logs=s_logs,
+                cv_seed=int(spec["cv_seed"]),
+            )
+            best = ranked[0]
+
+            if effective_task_type == "binary_classification":
+                blend_mode = str(spec["blend_mode"])
+                if blend_mode == "full" and not _FAST_MODE:
+                    preds = _predict_binary_with_blend(
+                        ranked_results=ranked,
+                        X_train=X_train,
+                        y=y,
+                        X_test=X_test,
+                        train_df=train_df,
+                        test_df=test_df,
+                        logs=s_logs,
+                    )
+                elif blend_mode == "fast":
+                    preds = _predict_binary_with_fast_blend(
+                        ranked_results=ranked,
+                        X_train=X_train,
+                        y=y,
+                        X_test=X_test,
+                        logs=s_logs,
+                    )
+                else:
+                    preds = _predict_binary_with_single_model(
+                        best=best,
+                        X_train=X_train,
+                        y=y,
+                        X_test=X_test,
+                        logs=s_logs,
+                        tune_threshold=not _SAFE_MODE,
+                    )
+            else:
+                final_model = clone(best.model)
+                final_model.fit(X_train, y)
+                preds = final_model.predict(X_test)
+
+            formatted_preds = format_predictions(
+                preds=preds,
+                y_raw=y_raw,
+                sample_df=sample_df,
+                pred_col=pred_col,
+                task_meta=task_meta,
+            )
+            submission = pd.DataFrame(
+                {
+                    sample_df.columns[0]: test_df[id_col].values if id_col in test_df.columns else sample_df.iloc[:, 0].values,
+                    sample_df.columns[1]: pd.Series(formatted_preds, dtype="object"),
+                }
+            )
+            submission = sanitize_submission(submission, sample_df)
+
+            cv_score = float(best.score)
+            logs.append(
+                f"strategy_result: name={s_name} best_model={best.name} cv={cv_score:.6f}"
+            )
+            logs.extend([f"[{s_name}] {line}" for line in s_logs])
+
+            if cv_score > best_score:
+                best_score = cv_score
+                best_submission = submission
+                best_model_name = best.name
+                best_strategy_name = s_name
+                logs.append(
+                    f"strategy_selected_current_best: name={best_strategy_name} cv={best_score:.6f}"
+                )
+        except Exception as exc:
+            logs.append(f"strategy_failed: name={s_name} error={exc}")
+
+    if best_submission is None:
+        raise RuntimeError("All strategy attempts failed")
 
     summary = "\n".join(
         [
@@ -1435,14 +1562,15 @@ def solve_competition(
             f"task_type={effective_task_type}",
             f"train_shape={train_df.shape}",
             f"test_shape={test_df.shape}",
-            f"best_model={best.name}",
-            f"best_cv={best.score:.6f}",
+            f"best_strategy={best_strategy_name}",
+            f"best_model={best_model_name}",
+            f"best_cv={best_score:.6f}",
             "",
             "candidate_results:",
             *logs,
         ]
     )
-    return submission, summary
+    return best_submission, summary
 
 
 class Agent:
