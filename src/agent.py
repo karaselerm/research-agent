@@ -9,6 +9,7 @@ import os
 import re
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from dataclasses import dataclass
@@ -47,6 +48,12 @@ _ROUTERAI_MODEL = os.environ.get(
     "ROUTERAI_MODEL",
     os.environ.get("OPENROUTER_MODEL", "openai/gpt-5.4-mini"),
 ).strip()
+_AGENT_MODE = os.environ.get("AGENT_MODE", "fast").strip().lower()
+if _AGENT_MODE not in {"safe", "fast", "standard", "heavy"}:
+    _AGENT_MODE = "fast"
+_SAFE_MODE = _AGENT_MODE == "safe"
+_FAST_MODE = _AGENT_MODE in {"safe", "fast"}
+_SOLVE_TIMEOUT_SEC = int(os.environ.get("SOLVE_TIMEOUT_SEC", "300"))
 
 
 def _extract_tar_b64(b64_text: str, dest: Path) -> None:
@@ -374,6 +381,7 @@ def _make_bool_numeric_interactions(
 
 
 def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    started = time.perf_counter()
     X = X.copy()
 
     for col in X.columns:
@@ -403,17 +411,20 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
                 X[f"{col}__z_like"] = (s - float(non_na.median())) / abs_q95
 
     object_cols = [c for c in X.columns if X[c].dtype == object]
-    for col in object_cols[:10]:
+    max_object_profiles = 6 if _FAST_MODE else 10
+    for col in object_cols[:max_object_profiles]:
         prof = _string_profile_features(raw_df[col] if col in raw_df.columns else X[col], col)
         X = pd.concat([X, prof], axis=1)
 
-    for col in _candidate_structured_string_columns(raw_df)[:5]:
+    max_structured_cols = 3 if _FAST_MODE else 5
+    for col in _candidate_structured_string_columns(raw_df)[:max_structured_cols]:
         if col in raw_df.columns:
             X = pd.concat([X, _split_structured_column(raw_df[col], col)], axis=1)
 
     X = pd.concat([X, _make_numeric_aggregates(X)], axis=1)
-    X = pd.concat([X, _make_group_aggregates(X, raw_df)], axis=1)
-    X = pd.concat([X, _make_bool_numeric_interactions(X)], axis=1)
+    if not _FAST_MODE:
+        X = pd.concat([X, _make_group_aggregates(X, raw_df)], axis=1)
+        X = pd.concat([X, _make_bool_numeric_interactions(X)], axis=1)
 
     # Drop raw identifier-like columns after extracting useful statistics.
     drop_cols: list[str] = []
@@ -425,6 +436,12 @@ def make_features(X: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
         X = X.drop(columns=drop_cols, errors="ignore")
 
     X = X.replace([np.inf, -np.inf], np.nan)
+    logger.info(
+        "make_features finished in %.2fs with %d columns (mode=%s)",
+        time.perf_counter() - started,
+        X.shape[1],
+        _AGENT_MODE,
+    )
     return X
 
 
@@ -690,145 +707,142 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
     pre_ohe, pre_ord = _build_preprocessors(X)
     candidates: list[tuple[str, Any]] = []
 
-    if task_type == "binary_classification":
-        candidates.extend(
-            [
+    if _SAFE_MODE:
+        if task_type == "binary_classification":
+            return [
                 (
                     "logreg_ohe",
                     Pipeline(
                         [
                             ("pre", pre_ohe),
-                            ("model", LogisticRegression(max_iter=5000, C=1.4, solver="liblinear", random_state=42)),
+                            ("model", LogisticRegression(max_iter=1500, C=1.0, solver="liblinear", random_state=42)),
                         ]
                     ),
-                ),
+                )
+            ]
+        if task_type == "classification":
+            return [
                 (
-                    "logreg_balanced_ohe",
-                    Pipeline(
-                        [
-                            ("pre", pre_ohe),
-                            (
-                                "model",
-                                LogisticRegression(
-                                    max_iter=6000,
-                                    C=1.2,
-                                    solver="liblinear",
-                                    class_weight="balanced",
-                                    random_state=42,
-                                ),
+                    "logreg_ohe",
+                    Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=1500, random_state=42))]),
+                )
+            ]
+        return [("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))]))]
+
+    if task_type == "binary_classification":
+        candidates = [
+            (
+                "logreg_ohe",
+                Pipeline(
+                    [
+                        ("pre", pre_ohe),
+                        ("model", LogisticRegression(max_iter=2000, C=1.2, solver="liblinear", random_state=42)),
+                    ]
+                ),
+            ),
+            (
+                "extratrees_ohe",
+                Pipeline(
+                    [
+                        ("pre", pre_ohe),
+                        (
+                            "model",
+                            ExtraTreesClassifier(
+                                n_estimators=260 if _FAST_MODE else 500,
+                                max_depth=None,
+                                min_samples_leaf=1,
+                                random_state=42,
+                                n_jobs=-1,
                             ),
-                        ]
-                    ),
+                        ),
+                    ]
                 ),
-                (
-                    "extratrees_ohe",
-                    Pipeline(
-                        [
-                            ("pre", pre_ohe),
-                            ("model", ExtraTreesClassifier(n_estimators=1200, max_depth=None, min_samples_leaf=1, random_state=42, n_jobs=-1)),
-                        ]
-                    ),
+            ),
+            (
+                "hgb_ordinal",
+                Pipeline(
+                    [
+                        ("pre", pre_ord),
+                        (
+                            "model",
+                            HistGradientBoostingClassifier(
+                                learning_rate=0.06,
+                                max_depth=8,
+                                max_iter=180 if _FAST_MODE else 320,
+                                l2_regularization=0.05,
+                                random_state=42,
+                            ),
+                        ),
+                    ]
                 ),
+            ),
+        ]
+        if not _FAST_MODE:
+            candidates.append(
                 (
                     "rf_ohe",
                     Pipeline(
                         [
                             ("pre", pre_ohe),
-                            ("model", RandomForestClassifier(n_estimators=900, max_depth=18, min_samples_leaf=2, max_features="sqrt", random_state=42, n_jobs=-1)),
-                        ]
-                    ),
-                ),
-                (
-                    "hgb_ordinal_main",
-                    Pipeline(
-                        [
-                            ("pre", pre_ord),
-                            ("model", HistGradientBoostingClassifier(learning_rate=0.04, max_depth=8, max_iter=500, l2_regularization=0.05, random_state=42)),
-                        ]
-                    ),
-                ),
-                (
-                    "hgb_ordinal_alt",
-                    Pipeline(
-                        [
-                            ("pre", pre_ord),
-                            ("model", HistGradientBoostingClassifier(learning_rate=0.03, max_depth=10, max_iter=700, l2_regularization=0.08, random_state=42)),
-                        ]
-                    ),
-                ),
-                (
-                    "gb_ordinal",
-                    Pipeline(
-                        [
-                            ("pre", pre_ord),
                             (
                                 "model",
-                                GradientBoostingClassifier(
-                                    n_estimators=350,
-                                    learning_rate=0.035,
-                                    max_depth=3,
-                                    subsample=0.9,
+                                RandomForestClassifier(
+                                    n_estimators=450,
+                                    max_depth=18,
+                                    min_samples_leaf=2,
+                                    max_features="sqrt",
                                     random_state=42,
+                                    n_jobs=-1,
                                 ),
                             ),
                         ]
                     ),
-                ),
-            ]
-        )
+                )
+            )
     elif task_type == "classification":
-        candidates.extend(
-            [
-                ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=4000, random_state=42))])),
-                ("extratrees_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesClassifier(n_estimators=1000, random_state=42, n_jobs=-1))])),
-                ("hgb_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingClassifier(max_iter=500, random_state=42))])),
-                (
-                    "gb_ordinal",
-                    Pipeline(
-                        [
-                            ("pre", pre_ord),
-                            (
-                                "model",
-                                GradientBoostingClassifier(
-                                    n_estimators=300,
-                                    learning_rate=0.04,
-                                    max_depth=3,
-                                    subsample=0.9,
-                                    random_state=42,
-                                ),
-                            ),
-                        ]
-                    ),
+        candidates = [
+            ("logreg_ohe", Pipeline([("pre", pre_ohe), ("model", LogisticRegression(max_iter=2000, random_state=42))])),
+            (
+                "extratrees_ohe",
+                Pipeline(
+                    [
+                        ("pre", pre_ohe),
+                        ("model", ExtraTreesClassifier(n_estimators=260 if _FAST_MODE else 500, random_state=42, n_jobs=-1)),
+                    ]
                 ),
-            ]
-        )
+            ),
+            (
+                "hgb_ordinal",
+                Pipeline(
+                    [
+                        ("pre", pre_ord),
+                        ("model", HistGradientBoostingClassifier(max_iter=180 if _FAST_MODE else 320, random_state=42)),
+                    ]
+                ),
+            ),
+        ]
     else:
-        candidates.extend(
-            [
-                ("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))])),
-                ("extratrees_reg_ohe", Pipeline([("pre", pre_ohe), ("model", ExtraTreesRegressor(n_estimators=1000, random_state=42, n_jobs=-1))])),
-                ("rf_reg_ohe", Pipeline([("pre", pre_ohe), ("model", RandomForestRegressor(n_estimators=800, random_state=42, n_jobs=-1))])),
-                ("hgb_reg_ordinal", Pipeline([("pre", pre_ord), ("model", HistGradientBoostingRegressor(max_iter=500, random_state=42))])),
-                (
-                    "gb_reg_ordinal",
-                    Pipeline(
-                        [
-                            ("pre", pre_ord),
-                            (
-                                "model",
-                                GradientBoostingRegressor(
-                                    n_estimators=300,
-                                    learning_rate=0.04,
-                                    max_depth=3,
-                                    subsample=0.9,
-                                    random_state=42,
-                                ),
-                            ),
-                        ]
-                    ),
+        candidates = [
+            ("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))])),
+            (
+                "extratrees_reg_ohe",
+                Pipeline(
+                    [
+                        ("pre", pre_ohe),
+                        ("model", ExtraTreesRegressor(n_estimators=260 if _FAST_MODE else 500, random_state=42, n_jobs=-1)),
+                    ]
                 ),
-            ]
-        )
+            ),
+            (
+                "hgb_reg_ordinal",
+                Pipeline(
+                    [
+                        ("pre", pre_ord),
+                        ("model", HistGradientBoostingRegressor(max_iter=180 if _FAST_MODE else 320, random_state=42)),
+                    ]
+                ),
+            ),
+        ]
 
     return candidates
 
@@ -841,20 +855,34 @@ def evaluate_candidates(
     logs: list[str],
 ) -> list[CandidateResult]:
     results: list[CandidateResult] = []
+    started = time.perf_counter()
 
     if task_type in {"binary_classification", "classification"}:
-        cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        if _SAFE_MODE:
+            n_splits = 2
+        elif _FAST_MODE:
+            n_splits = 3
+        else:
+            n_splits = 5 if len(y) >= 500 else 4
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
         scoring = "accuracy"
     else:
-        cv = KFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
+        if _SAFE_MODE:
+            n_splits = 2
+        elif _FAST_MODE:
+            n_splits = 3
+        else:
+            n_splits = 5 if len(y) >= 500 else 4
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
         scoring = make_scorer(lambda yt, yp: -float(np.sqrt(mean_squared_error(yt, yp))), greater_is_better=True)
 
     for name, model in candidates:
         try:
+            model_started = time.perf_counter()
             scores = cross_val_score(model, X, y, cv=cv, scoring=scoring, n_jobs=1)
             score = float(np.mean(scores))
             results.append(CandidateResult(name=name, score=score, model=model))
-            logs.append(f"{name}: {score:.6f}")
+            logs.append(f"{name}: {score:.6f} fit_time_sec={time.perf_counter() - model_started:.2f}")
         except Exception as e:
             logs.append(f"{name}: FAILED ({e})")
 
@@ -862,6 +890,7 @@ def evaluate_candidates(
         raise RuntimeError("All candidate models failed.")
 
     results.sort(key=lambda r: r.score, reverse=True)
+    logs.append(f"evaluate_candidates_time_sec={time.perf_counter() - started:.2f}")
     return results
 
 
@@ -878,6 +907,53 @@ def _best_threshold(
             best_acc = acc
             best_threshold = float(threshold)
     return best_threshold, best_acc
+
+
+def _predict_binary_with_single_model(
+    best: CandidateResult,
+    X_train: pd.DataFrame,
+    y: pd.Series,
+    X_test: pd.DataFrame,
+    logs: list[str],
+    tune_threshold: bool,
+) -> np.ndarray:
+    final_model = clone(best.model)
+    final_model.fit(X_train, y)
+
+    if not hasattr(final_model, "predict_proba"):
+        logs.append(f"binary_single_model_no_proba: {best.name}")
+        return pd.Series(final_model.predict(X_test)).astype(int).to_numpy()
+
+    threshold = 0.5
+    if tune_threshold and len(y) >= 300:
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+        oof = np.full(len(y), np.nan, dtype=float)
+        for train_idx, valid_idx in cv.split(X_train, y):
+            try:
+                fold_model = clone(best.model)
+                fold_model.fit(X_train.iloc[train_idx], y.iloc[train_idx])
+                oof[valid_idx] = fold_model.predict_proba(X_train.iloc[valid_idx])[:, 1]
+            except Exception as exc:
+                logs.append(f"binary_threshold_fold_failed: {exc}")
+
+        mask = np.isfinite(oof)
+        if int(mask.sum()) >= max(100, int(0.8 * len(y))):
+            candidate_thresholds = np.linspace(0.45, 0.55, 21)
+            tuned_threshold, tuned_acc = _best_threshold(
+                probabilities=oof[mask],
+                y_true=y.iloc[mask].to_numpy(),
+                threshold_grid=candidate_thresholds,
+            )
+            base_acc = float(accuracy_score(y.iloc[mask].to_numpy(), (oof[mask] >= 0.5).astype(int)))
+            if tuned_acc >= base_acc + 0.0015:
+                threshold = tuned_threshold
+            logs.append(
+                f"binary_threshold_tuning: base_acc={base_acc:.6f} tuned_acc={tuned_acc:.6f} threshold={threshold:.4f}"
+            )
+
+    test_proba = final_model.predict_proba(X_test)[:, 1]
+    logs.append(f"binary_single_model_selected: {best.name} threshold={threshold:.4f}")
+    return (test_proba >= threshold).astype(int)
 
 
 def _select_group_consensus_spec(
@@ -1217,26 +1293,34 @@ def solve_competition(
     # Raw id columns are dropped later in make_features, but their split/group
     # patterns can provide transferable signal without task-specific hardcoding.
 
+    feature_started = time.perf_counter()
     X_train = make_features(X_train_raw, train_df)
     X_test = make_features(X_test_raw, test_df)
     X_test = align_columns(X_train, X_test)
+    logs.append(f"feature_time_sec={time.perf_counter() - feature_started:.2f}")
+    logs.append(f"n_features_after_engineering={X_train.shape[1]}")
 
     y, task_meta = prepare_target(y_raw, task_type)
     effective_task_type = task_meta["task_type"]
-    X_train, X_test = _add_target_encoding_features(
-        X_train=X_train,
-        X_test=X_test,
-        y=y,
-        task_type=effective_task_type,
-        logs=logs,
-    )
-    X_test = align_columns(X_train, X_test)
+    if not _FAST_MODE:
+        X_train, X_test = _add_target_encoding_features(
+            X_train=X_train,
+            X_test=X_test,
+            y=y,
+            task_type=effective_task_type,
+            logs=logs,
+        )
+        X_test = align_columns(X_train, X_test)
+    else:
+        logs.append("target_encoding_skipped_in_fast_mode")
 
+    logs.append(f"agent_mode={_AGENT_MODE}")
     candidates = build_candidates(X_train, effective_task_type)
+    logs.append(f"candidate_count={len(candidates)}")
     ranked = evaluate_candidates(X_train, y, candidates, effective_task_type, logs=logs)
     best = ranked[0]
 
-    if effective_task_type == "binary_classification":
+    if effective_task_type == "binary_classification" and not _FAST_MODE:
         preds = _predict_binary_with_blend(
             ranked_results=ranked,
             X_train=X_train,
@@ -1245,6 +1329,15 @@ def solve_competition(
             train_df=train_df,
             test_df=test_df,
             logs=logs,
+        )
+    elif effective_task_type == "binary_classification":
+        preds = _predict_binary_with_single_model(
+            best=best,
+            X_train=X_train,
+            y=y,
+            X_test=X_test,
+            logs=logs,
+            tune_threshold=not _SAFE_MODE,
         )
     else:
         final_model = clone(best.model)
@@ -1288,7 +1381,6 @@ def solve_competition(
 class Agent:
     def __init__(self) -> None:
         self._done_context: set[str] = set()
-        self.logs: list[str] = []
         self._current_work_dir: Path | None = None
         self._current_text: str = ""
         self._current_updater: TaskUpdater | None = None
@@ -1318,6 +1410,7 @@ class Agent:
         sample_df: pd.DataFrame,
         description: str,
         task: dict[str, object],
+        logs: list[str],
     ) -> tuple[pd.DataFrame, str]:
         _ = description
         return solve_competition(
@@ -1325,7 +1418,7 @@ class Agent:
             test_df=test_df,
             sample_df=sample_df,
             task=task,
-            logs=self.logs,
+            logs=logs,
         )
 
     async def _add_submission_artifact(
@@ -1357,6 +1450,7 @@ class Agent:
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         ctx = message.context_id or "default"
+        logs: list[str] = []
         self._current_text = get_message_text(message)
 
         if ctx in self._done_context:
@@ -1423,7 +1517,7 @@ class Agent:
                 )
                 return
 
-            self.logs.append(
+            logs.append(
                 json.dumps(
                     {
                         "llm_config": {
@@ -1459,7 +1553,7 @@ class Agent:
 
             try:
                 task = infer_task(train_df, test_df, sample_df)
-                self.logs.append(json.dumps(task, ensure_ascii=False))
+                logs.append(json.dumps(task, ensure_ascii=False))
 
                 await updater.update_status(
                     TaskState.working,
@@ -1474,21 +1568,31 @@ class Agent:
                         sample_df,
                         description,
                         task,
+                        logs,
                     )
                 )
-                heartbeat_seconds = 0
+                heartbeat_seconds = 0.0
+                heartbeat_interval = 15.0
+                start_time = time.monotonic()
                 while not solve_task.done():
-                    await asyncio.sleep(20)
-                    heartbeat_seconds += 20
+                    elapsed = time.monotonic() - start_time
+                    if elapsed >= float(_SOLVE_TIMEOUT_SEC):
+                        solve_task.cancel()
+                        raise TimeoutError(
+                            f"solve timeout exceeded {_SOLVE_TIMEOUT_SEC}s in mode={_AGENT_MODE}"
+                        )
+
+                    await asyncio.sleep(min(heartbeat_interval, max(1.0, float(_SOLVE_TIMEOUT_SEC) - elapsed)))
+                    heartbeat_seconds = time.monotonic() - start_time
                     await updater.update_status(
                         TaskState.working,
                         new_agent_text_message(
-                            f"Training models... elapsed {heartbeat_seconds}s"
+                            f"Training models... elapsed {int(heartbeat_seconds)}s (mode={_AGENT_MODE})"
                         ),
                     )
 
                 submission_df, summary = await solve_task
-                self.logs.append(summary)
+                logs.append(summary)
 
                 self._validate_submission(submission_df, sample_df)
 
@@ -1504,7 +1608,7 @@ class Agent:
 
             except Exception as exc:
                 logger.exception("Modeling failed")
-                self.logs.append(f"fallback_used: {exc}")
+                logs.append(f"fallback_used: {exc}")
                 await updater.update_status(
                     TaskState.working,
                     new_agent_text_message(
