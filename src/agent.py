@@ -10,6 +10,7 @@ import re
 import tarfile
 import tempfile
 import time
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 from dataclasses import dataclass
@@ -48,9 +49,9 @@ _ROUTERAI_MODEL = os.environ.get(
     "ROUTERAI_MODEL",
     os.environ.get("OPENROUTER_MODEL", "openai/gpt-5.4-mini"),
 ).strip()
-_AGENT_MODE = os.environ.get("AGENT_MODE", "fast").strip().lower()
+_AGENT_MODE = os.environ.get("AGENT_MODE", "standard").strip().lower()
 if _AGENT_MODE not in {"safe", "fast", "standard", "heavy"}:
-    _AGENT_MODE = "fast"
+    _AGENT_MODE = "standard"
 _SAFE_MODE = _AGENT_MODE == "safe"
 _FAST_MODE = _AGENT_MODE in {"safe", "fast"}
 _SOLVE_TIMEOUT_SEC = int(os.environ.get("SOLVE_TIMEOUT_SEC", "300"))
@@ -380,6 +381,51 @@ def _make_bool_numeric_interactions(
     return out
 
 
+def _make_categorical_pair_features(
+    X: pd.DataFrame,
+    max_cols: int = 5,
+    max_pairs: int = 6,
+) -> pd.DataFrame:
+    out = pd.DataFrame(index=X.index)
+    object_cols = [c for c in X.columns if X[c].dtype == object]
+    if len(object_cols) < 2:
+        return out
+
+    scored: list[tuple[float, str]] = []
+    n_rows = max(1, len(X))
+    for col in object_cols:
+        s = X[col].fillna("__NA__").astype(str)
+        nunique = int(s.nunique(dropna=False))
+        if nunique < 2:
+            continue
+        if nunique > max(120, int(0.45 * n_rows)):
+            continue
+        repeat_ratio = 1.0 - (float(nunique) / float(n_rows))
+        scored.append((repeat_ratio, col))
+
+    if len(scored) < 2:
+        return out
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [col for _, col in scored[:max_cols]]
+
+    pair_count = 0
+    for col_a, col_b in combinations(selected, 2):
+        pair_name = f"{col_a}__x__{col_b}"
+        pair = (
+            X[col_a].fillna("__NA__").astype(str)
+            + "__"
+            + X[col_b].fillna("__NA__").astype(str)
+        )
+        out[pair_name] = pair
+        out[f"{pair_name}__freq"] = pair.map(pair.value_counts(dropna=False))
+        pair_count += 1
+        if pair_count >= max_pairs:
+            break
+
+    return out
+
+
 def make_features(
     X: pd.DataFrame,
     raw_df: pd.DataFrame,
@@ -402,6 +448,9 @@ def make_features(
     numeric_cols = X.select_dtypes(include=[np.number, "bool"]).columns.tolist()
     for col in numeric_cols[:20]:
         X[f"{col}__is_missing"] = pd.to_numeric(X[col], errors="coerce").isna().astype(int)
+
+    X["__row_missing_count"] = X.isna().sum(axis=1).astype(float)
+    X["__row_missing_ratio"] = X["__row_missing_count"] / float(max(1, X.shape[1]))
 
     for col in numeric_cols[:12]:
         s = pd.to_numeric(X[col], errors="coerce")
@@ -426,6 +475,13 @@ def make_features(
     for col in _candidate_structured_string_columns(raw_df)[:max_structured_cols]:
         if col in raw_df.columns:
             X = pd.concat([X, _split_structured_column(raw_df[col], col)], axis=1)
+
+    pair_cols = 3 if _FAST_MODE else 5
+    pair_limit = 3 if _FAST_MODE else 6
+    X = pd.concat(
+        [X, _make_categorical_pair_features(X, max_cols=pair_cols, max_pairs=pair_limit)],
+        axis=1,
+    )
 
     X = pd.concat([X, _make_numeric_aggregates(X)], axis=1)
     if expensive:
@@ -715,6 +771,7 @@ def _build_preprocessors(X: pd.DataFrame) -> tuple[ColumnTransformer, ColumnTran
 def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
     pre_ohe, pre_ord = _build_preprocessors(X)
     candidates: list[tuple[str, Any]] = []
+    medium_sized = len(X) <= 50000 and X.shape[1] <= 1200
 
     if _SAFE_MODE:
         if task_type == "binary_classification":
@@ -746,6 +803,24 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     [
                         ("pre", pre_ohe),
                         ("model", LogisticRegression(max_iter=2000, C=1.2, solver="liblinear", random_state=42)),
+                    ]
+                ),
+            ),
+            (
+                "logreg_ohe_balanced",
+                Pipeline(
+                    [
+                        ("pre", pre_ohe),
+                        (
+                            "model",
+                            LogisticRegression(
+                                max_iter=2200,
+                                C=0.9,
+                                solver="liblinear",
+                                class_weight="balanced",
+                                random_state=42,
+                            ),
+                        ),
                     ]
                 ),
             ),
@@ -785,8 +860,26 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                     ]
                 ),
             ),
+            (
+                "hgb_ordinal_alt",
+                Pipeline(
+                    [
+                        ("pre", pre_ord),
+                        (
+                            "model",
+                            HistGradientBoostingClassifier(
+                                learning_rate=0.045,
+                                max_depth=10,
+                                max_iter=220 if _FAST_MODE else 380,
+                                l2_regularization=0.08,
+                                random_state=42,
+                            ),
+                        ),
+                    ]
+                ),
+            ),
         ]
-        if not _FAST_MODE:
+        if medium_sized:
             candidates.append(
                 (
                     "rf_ohe",
@@ -796,12 +889,31 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                             (
                                 "model",
                                 RandomForestClassifier(
-                                    n_estimators=450,
+                                    n_estimators=260 if _FAST_MODE else 480,
                                     max_depth=18,
                                     min_samples_leaf=2,
                                     max_features="sqrt",
                                     random_state=42,
                                     n_jobs=-1,
+                                ),
+                            ),
+                        ]
+                    ),
+                )
+            )
+            candidates.append(
+                (
+                    "gb_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingClassifier(
+                                    learning_rate=0.05,
+                                    n_estimators=260 if _FAST_MODE else 360,
+                                    max_depth=3,
+                                    random_state=42,
                                 ),
                             ),
                         ]
@@ -830,6 +942,26 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                 ),
             ),
         ]
+        if medium_sized:
+            candidates.append(
+                (
+                    "gb_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingClassifier(
+                                    learning_rate=0.05,
+                                    n_estimators=240 if _FAST_MODE else 340,
+                                    max_depth=3,
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                )
+            )
     else:
         candidates = [
             ("ridge_ohe", Pipeline([("pre", pre_ohe), ("model", Ridge(alpha=1.0, random_state=42))])),
@@ -852,6 +984,26 @@ def build_candidates(X: pd.DataFrame, task_type: str) -> list[tuple[str, Any]]:
                 ),
             ),
         ]
+        if medium_sized:
+            candidates.append(
+                (
+                    "gb_reg_ordinal",
+                    Pipeline(
+                        [
+                            ("pre", pre_ord),
+                            (
+                                "model",
+                                GradientBoostingRegressor(
+                                    learning_rate=0.05,
+                                    n_estimators=260 if _FAST_MODE else 360,
+                                    max_depth=3,
+                                    random_state=42,
+                                ),
+                            ),
+                        ]
+                    ),
+                )
+            )
 
     return candidates
 
@@ -926,15 +1078,16 @@ def _predict_binary_with_single_model(
     X_test: pd.DataFrame,
     logs: list[str],
     tune_threshold: bool,
-) -> np.ndarray:
+) -> tuple[np.ndarray, float | None]:
     final_model = clone(best.model)
     final_model.fit(X_train, y)
 
     if not hasattr(final_model, "predict_proba"):
         logs.append(f"binary_single_model_no_proba: {best.name}")
-        return pd.Series(final_model.predict(X_test)).astype(int).to_numpy()
+        return pd.Series(final_model.predict(X_test)).astype(int).to_numpy(), None
 
     threshold = 0.5
+    estimated_acc: float | None = None
     if tune_threshold and len(y) >= 300:
         cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
         oof = np.full(len(y), np.nan, dtype=float)
@@ -957,13 +1110,16 @@ def _predict_binary_with_single_model(
             base_acc = float(accuracy_score(y.iloc[mask].to_numpy(), (oof[mask] >= 0.5).astype(int)))
             if tuned_acc >= base_acc + 0.0015:
                 threshold = tuned_threshold
+                estimated_acc = tuned_acc
+            else:
+                estimated_acc = base_acc
             logs.append(
                 f"binary_threshold_tuning: base_acc={base_acc:.6f} tuned_acc={tuned_acc:.6f} threshold={threshold:.4f}"
             )
 
     test_proba = final_model.predict_proba(X_test)[:, 1]
     logs.append(f"binary_single_model_selected: {best.name} threshold={threshold:.4f}")
-    return (test_proba >= threshold).astype(int)
+    return (test_proba >= threshold).astype(int), estimated_acc
 
 
 def _predict_binary_with_fast_blend(
@@ -972,8 +1128,8 @@ def _predict_binary_with_fast_blend(
     y: pd.Series,
     X_test: pd.DataFrame,
     logs: list[str],
-) -> np.ndarray:
-    members = [r for r in ranked_results[:3] if hasattr(r.model, "predict_proba")]
+) -> tuple[np.ndarray, float | None]:
+    members = [r for r in ranked_results[:4] if hasattr(r.model, "predict_proba")]
     if len(members) < 2:
         return _predict_binary_with_single_model(
             best=ranked_results[0],
@@ -990,6 +1146,7 @@ def _predict_binary_with_fast_blend(
         logs.append(f"binary_fast_blend_member: {member.name} weight={weight:.4f}")
 
     threshold = 0.5
+    estimated_acc: float | None = None
     if not _SAFE_MODE and len(y) >= 350:
         cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
         oof = np.full(len(y), np.nan, dtype=float)
@@ -1012,6 +1169,9 @@ def _predict_binary_with_fast_blend(
             base_acc = float(accuracy_score(y.iloc[mask].to_numpy(), (oof[mask] >= 0.5).astype(int)))
             if tuned_acc >= base_acc + 0.001:
                 threshold = tuned_threshold
+                estimated_acc = tuned_acc
+            else:
+                estimated_acc = base_acc
             logs.append(
                 f"binary_fast_blend_threshold: base_acc={base_acc:.6f} tuned_acc={tuned_acc:.6f} threshold={threshold:.4f}"
             )
@@ -1023,7 +1183,7 @@ def _predict_binary_with_fast_blend(
         test_proba += weight * model.predict_proba(X_test)[:, 1]
 
     logs.append(f"binary_fast_blend_selected: threshold={threshold:.4f} members={len(members)}")
-    return (test_proba >= threshold).astype(int)
+    return (test_proba >= threshold).astype(int), estimated_acc
 
 
 def _select_group_consensus_spec(
@@ -1109,7 +1269,7 @@ def _predict_binary_with_blend(
     train_df: pd.DataFrame,
     test_df: pd.DataFrame,
     logs: list[str],
-) -> np.ndarray:
+) -> tuple[np.ndarray, float | None]:
     def _normalize(weights: np.ndarray) -> np.ndarray:
         weights = np.asarray(weights, dtype=float)
         weights = np.where(np.isfinite(weights), weights, 0.0)
@@ -1124,8 +1284,8 @@ def _predict_binary_with_blend(
         best.fit(X_train, y)
         logs.append(f"binary_fallback_model: {ranked_results[0].name}")
         if hasattr(best, "predict_proba"):
-            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
-        return best.predict(X_test)
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int), float(ranked_results[0].score)
+        return best.predict(X_test), float(ranked_results[0].score)
 
     cv = StratifiedKFold(n_splits=5 if len(y) >= 500 else 4, shuffle=True, random_state=42)
     oof_matrix = np.full((len(y), len(members)), np.nan, dtype=float)
@@ -1145,8 +1305,8 @@ def _predict_binary_with_blend(
         best.fit(X_train, y)
         logs.append("binary_oof_insufficient: fallback_to_best_model")
         if hasattr(best, "predict_proba"):
-            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
-        return best.predict(X_test)
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int), float(ranked_results[0].score)
+        return best.predict(X_test), float(ranked_results[0].score)
 
     score_vec = np.array([max(1e-6, float(m.score)) for m in members], dtype=float)
     w_sq = _normalize(score_vec ** 2)
@@ -1227,8 +1387,8 @@ def _predict_binary_with_blend(
         best.fit(X_train, y)
         logs.append("binary_test_matrix_failed: fallback_to_best_model")
         if hasattr(best, "predict_proba"):
-            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
-        return best.predict(X_test)
+            return (best.predict_proba(X_test)[:, 1] >= 0.5).astype(int), float(ranked_results[0].score)
+        return best.predict(X_test), float(ranked_results[0].score)
 
     test_matrix = test_matrix[:, valid_cols]
     valid_members = [m for m, ok in zip(members, valid_cols) if ok]
@@ -1265,7 +1425,7 @@ def _predict_binary_with_blend(
     logs.append(
         f"binary_selected_config: {selected_name} threshold={selected_threshold:.4f} oof_acc={selected_score:.6f} mode={_BINARY_STRATEGY}"
     )
-    return (final_proba >= selected_threshold).astype(int)
+    return (final_proba >= selected_threshold).astype(int), float(selected_score)
 
 
 def format_predictions(
@@ -1361,6 +1521,11 @@ def solve_competition(
     X_test_raw = test_df.copy()
     y, task_meta = prepare_target(y_raw, task_type)
     effective_task_type = task_meta["task_type"]
+    allow_heavier_binary_search = (
+        effective_task_type == "binary_classification"
+        and len(train_df) <= 40000
+        and train_df.shape[1] <= 250
+    )
 
     # Structural pass@k idea (from arena-style agents), but inside one process:
     # run multiple independent strategy seeds and pick the highest-CV output.
@@ -1394,6 +1559,17 @@ def solve_competition(
                 "cv_seed": 314,
             },
         ]
+        if allow_heavier_binary_search:
+            strategy_specs.append(
+                {
+                    "name": "fast_full_blend",
+                    "expensive_features": True,
+                    "target_encoding": True,
+                    "max_te_cols": 8,
+                    "blend_mode": "full",
+                    "cv_seed": 2718,
+                }
+            )
     else:
         strategy_specs = [
             {
@@ -1484,11 +1660,12 @@ def solve_competition(
                 cv_seed=int(spec["cv_seed"]),
             )
             best = ranked[0]
+            strategy_score = float(best.score)
 
             if effective_task_type == "binary_classification":
                 blend_mode = str(spec["blend_mode"])
-                if blend_mode == "full" and not _FAST_MODE:
-                    preds = _predict_binary_with_blend(
+                if blend_mode == "full":
+                    preds, estimated_binary_score = _predict_binary_with_blend(
                         ranked_results=ranked,
                         X_train=X_train,
                         y=y,
@@ -1498,7 +1675,7 @@ def solve_competition(
                         logs=s_logs,
                     )
                 elif blend_mode == "fast":
-                    preds = _predict_binary_with_fast_blend(
+                    preds, estimated_binary_score = _predict_binary_with_fast_blend(
                         ranked_results=ranked,
                         X_train=X_train,
                         y=y,
@@ -1506,7 +1683,7 @@ def solve_competition(
                         logs=s_logs,
                     )
                 else:
-                    preds = _predict_binary_with_single_model(
+                    preds, estimated_binary_score = _predict_binary_with_single_model(
                         best=best,
                         X_train=X_train,
                         y=y,
@@ -1514,10 +1691,16 @@ def solve_competition(
                         logs=s_logs,
                         tune_threshold=not _SAFE_MODE,
                     )
+                if estimated_binary_score is not None and np.isfinite(estimated_binary_score):
+                    strategy_score = max(strategy_score, float(estimated_binary_score))
+                s_logs.append(
+                    f"strategy_score_binary={strategy_score:.6f} (base_cv={float(best.score):.6f})"
+                )
             else:
                 final_model = clone(best.model)
                 final_model.fit(X_train, y)
                 preds = final_model.predict(X_test)
+                s_logs.append(f"strategy_score_non_binary={strategy_score:.6f}")
 
             formatted_preds = format_predictions(
                 preds=preds,
@@ -1536,17 +1719,17 @@ def solve_competition(
 
             cv_score = float(best.score)
             logs.append(
-                f"strategy_result: name={s_name} best_model={best.name} cv={cv_score:.6f}"
+                f"strategy_result: name={s_name} best_model={best.name} cv={cv_score:.6f} strategy_score={strategy_score:.6f}"
             )
             logs.extend([f"[{s_name}] {line}" for line in s_logs])
 
-            if cv_score > best_score:
-                best_score = cv_score
+            if strategy_score > best_score:
+                best_score = strategy_score
                 best_submission = submission
                 best_model_name = best.name
                 best_strategy_name = s_name
                 logs.append(
-                    f"strategy_selected_current_best: name={best_strategy_name} cv={best_score:.6f}"
+                    f"strategy_selected_current_best: name={best_strategy_name} strategy_score={best_score:.6f}"
                 )
         except Exception as exc:
             logs.append(f"strategy_failed: name={s_name} error={exc}")
@@ -1564,7 +1747,7 @@ def solve_competition(
             f"test_shape={test_df.shape}",
             f"best_strategy={best_strategy_name}",
             f"best_model={best_model_name}",
-            f"best_cv={best_score:.6f}",
+            f"best_strategy_score={best_score:.6f}",
             "",
             "candidate_results:",
             *logs,

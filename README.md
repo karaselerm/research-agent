@@ -24,6 +24,7 @@ Environment variables:
 - `ROUTERAI_API_KEY`
 - `ROUTERAI_BASE_URL` (default: `https://routerai.ru/api/v1`)
 - `ROUTERAI_MODEL` (default: `openai/gpt-5.4-mini`)
+- `AGENT_MODE` (`safe` | `fast` | `standard` | `heavy`, default: `standard`)
 - `BINARY_STRATEGY` (`auto` | `stable` | `aggressive`, default: `auto`)
 
 ## Local run
