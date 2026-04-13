@@ -1608,16 +1608,6 @@ class Agent:
             baseline_submission_df = self._build_fallback_submission(test_df=test_df, sample_df=sample_df)
             self._validate_submission(baseline_submission_df, sample_df)
 
-            await updater.update_status(
-                TaskState.working,
-                new_agent_text_message("Submitting safe baseline submission..."),
-            )
-            await self._add_submission_artifact(
-                updater=updater,
-                submission_df=baseline_submission_df,
-                artifact_id="submission",
-            )
-
             try:
                 task = infer_task(train_df, test_df, sample_df)
                 logs.append(json.dumps(task, ensure_ascii=False))
@@ -1681,6 +1671,11 @@ class Agent:
                     new_agent_text_message(
                         "Model training failed or suspicious submission detected; using safe baseline submission."
                     ),
+                )
+                await self._add_submission_artifact(
+                    updater=updater,
+                    submission_df=baseline_submission_df,
+                    artifact_id="submission",
                 )
             finally:
                 self._current_work_dir = None
